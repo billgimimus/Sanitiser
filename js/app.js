@@ -2291,6 +2291,31 @@ async function handleDroppedFile(caseObj, file, emlSummaries) {
       return savedName;
     }
   }
+  if (lower.endsWith('.pdf')) {
+    if (!window.pdfjsLib) {
+      const buf = await file.arrayBuffer();
+      const savedName = await writeRawUnique(caseObj.rawHandle, file.name, buf);
+      showToast('.pdf support requires lib/pdf.min.js in the same folder. Saved raw for now.', true);
+      return savedName;
+    }
+    try {
+      const buf = await file.arrayBuffer();
+      const parsed = await parsePdf(buf, file.name);
+      const savedName = await writeUnique(caseObj.rawHandle, replaceExtension(file.name, '.txt'), parsed.text);
+      emlSummaries.push({
+        sourceName: file.name,
+        savedName,
+        attachments: [],
+        warnings: parsed.warnings,
+      });
+      return savedName;
+    } catch (err) {
+      const buf = await file.arrayBuffer();
+      const savedName = await writeRawUnique(caseObj.rawHandle, file.name, buf);
+      showToast(`Could not extract text from ${file.name} (${err.message}); saved raw. If it is a scanned image PDF, OCR is not yet in scope.`, true);
+      return savedName;
+    }
+  }
   if (lower.endsWith('.msg')) {
     if (typeof window.MsgReader !== 'function') {
       const buf = await file.arrayBuffer();
@@ -2328,6 +2353,72 @@ async function handleDroppedFile(caseObj, file, emlSummaries) {
  * header layout. Recipients are consolidated into To / Cc lines; the
  * primary body is text/plain (bodyHtml stripped as a fallback).
  */
+let pdfWorkerConfigured = false;
+
+/**
+ * Extract page text from a PDF. Configures the PDF.js worker on first
+ * use; if the worker path cannot be loaded (typical from `file://`),
+ * PDF.js's own main-thread fallback runs instead, which is slower but
+ * fine for the file sizes casework produces.
+ *
+ * Returns the same shape the other importers use so it can flow through
+ * the shared summary and audit path.
+ */
+async function parsePdf(arrayBuffer, sourceName) {
+  const pdfjs = window.pdfjsLib;
+  if (!pdfWorkerConfigured) {
+    try { pdfjs.GlobalWorkerOptions.workerSrc = 'lib/pdf.worker.min.js'; } catch (_e) { /* main-thread fallback */ }
+    pdfWorkerConfigured = true;
+  }
+  const loadingTask = pdfjs.getDocument({
+    data: new Uint8Array(arrayBuffer),
+    isEvalSupported: false,
+    disableFontFace: true,
+  });
+  const doc = await loadingTask.promise;
+  const warnings = [];
+  const parts = [`# Imported from PDF: ${sourceName}`, `# Pages: ${doc.numPages}`, ''];
+  for (let i = 1; i <= doc.numPages; i++) {
+    const page = await doc.getPage(i);
+    const text = await page.getTextContent();
+    const pageText = joinPdfLines(text.items);
+    parts.push(`--- Page ${i} ---`, pageText, '');
+    if (!pageText.trim()) warnings.push(`Page ${i} produced no text (image or scanned page).`);
+  }
+  if (doc.numPages && warnings.length === doc.numPages) {
+    warnings.push('No text extracted from any page. The PDF is likely scanned. OCR is not yet in scope.');
+  }
+  return { text: parts.join('\n'), warnings };
+}
+
+/**
+ * PDF.js emits text items with positional data, one item per run of
+ * glyphs. Reconstruct visual lines by grouping items whose y-position
+ * matches, then join them with spaces where the item.hasEOL flag
+ * indicates a line break.
+ */
+function joinPdfLines(items) {
+  if (!items.length) return '';
+  const lines = [];
+  let current = [];
+  let lastY = null;
+  for (const it of items) {
+    const y = it.transform ? it.transform[5] : null;
+    if (lastY !== null && y !== null && Math.abs(y - lastY) > 2) {
+      lines.push(current.join(''));
+      current = [];
+    }
+    current.push(it.str);
+    if (it.hasEOL) {
+      lines.push(current.join(''));
+      current = [];
+    }
+    lastY = y;
+  }
+  if (current.length) lines.push(current.join(''));
+  return lines.join('\n');
+}
+
 function parseMsg(arrayBuffer) {
   const reader = new window.MsgReader(arrayBuffer);
   const data = reader.getFileData();
@@ -2499,7 +2590,7 @@ async function selectFile(name) {
 function classifyUnsupported(name) {
   const lower = name.toLowerCase();
   const map = [
-    ['.pdf', 'PDFs are not yet extracted by the tool. PDF.js integration is phase 2.'],
+    ['.pdf', 'PDFs are extracted on drop. This file is a raw copy left over from before PDF support arrived; delete and re-drop the source to import it as text.'],
     ['.msg', 'Outlook .msg files are parsed on drop. This file is a raw copy left over from before .msg support arrived; delete and re-drop the source to import it as text.'],
     ['.doc', 'Legacy .doc format is not supported. Copy the text out and paste it back in.'],
     ['.docx', '.docx files are not yet parsed. Copy the text out and paste it back in.'],

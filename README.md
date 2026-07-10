@@ -58,9 +58,13 @@ A summary modal opens after import listing attachments and any parser warnings. 
 
 Outlook `.msg` files are parsed too, via a vendored `msgreader` bundle at `lib/msgreader.min.js`. Copy `lib/msgreader.min.js` and `lib/msgreader.LICENSE` across along with `js/app.js` and `index.html`. Drag `.msg` files onto a case the same way as `.eml`; the tool extracts sender, recipients, subject, date, body, and attachment metadata into a plain-text file, using the same header layout as `.eml`.
 
+## PDFs
+
+Drop a `.pdf` file onto a case and the tool extracts the text from every page and saves it as `<basename>.txt` inside the case. PDF.js does the extraction; the vendored bundle sits under `lib/pdf.min.js` and `lib/pdf.worker.min.js`. Scanned image PDFs produce no extracted text; the parser records a warning per page and points at OCR as a future addition.
+
 ## Formats the tool cannot yet parse
 
-Phase 1 handles plain-text files (`.txt`, `.md`, and other UTF-8 readable content) directly, plus `.eml` via the parser above. Outlook `.msg`, PDFs, `.docx`, and images arrive in the rest of phase 2. When you open a file the tool cannot read, you get a clear message rather than garbled bytes.
+Plain-text files (`.txt`, `.md`, other UTF-8 readable content), `.eml`, `.msg`, and `.pdf` all import. `.docx`, images, and OCR of scanned PDFs are still out of scope. When you open a file the tool cannot read, you get a clear message rather than garbled bytes.
 
 **The failsafe** is a per-case button labelled **Paste text as new file**. Open the source in its native viewer (Outlook, a PDF reader, whatever), copy the text you want to send to Claude, and paste it into the modal. The tool saves it as a `.txt` inside the case folder, records the paste in the case audit log, and opens it ready to sanitise. The rest of the workflow, including the mapping and the reverse integrity check, is identical.
 

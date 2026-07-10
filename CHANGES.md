@@ -45,6 +45,20 @@ Built:
 - Binary heuristic fallback for files with unfamiliar extensions: if the first kilobyte contains more than 5% control characters (excluding tab, CR, LF), the file is treated as unsupported.
 - Audit log now records paste-text events with the optional source note.
 
+## Phase 2.5: PDF text extraction
+
+Add vendored `lib/pdf.min.js` (320 KB) and `lib/pdf.worker.min.js` (1.06 MB) from `pdfjs-dist@3.11.174` (Apache 2.0). Drop handler routes `.pdf` files through PDF.js: text content per page is extracted, glued into visual lines by position, and saved as `<basename>.txt` inside the case with a header naming the page count. Pages that produce no text (scanned image PDFs) are recorded as warnings; if every page is empty, an additional line notes that OCR is out of scope.
+
+The worker script is configured to `lib/pdf.worker.min.js`; if that fails to load (typical from `file://`), PDF.js's own main-thread fallback runs. Slower but functional. `isEvalSupported: false` and `disableFontFace: true` are set to keep the extraction deterministic and lean.
+
+Files to copy across when updating a laptop:
+
+- `js/app.js`
+- `index.html`
+- `lib/pdf.min.js` (new)
+- `lib/pdf.worker.min.js` (new)
+- `lib/pdf.LICENSE` (new)
+
 ## Phase 2.4: Outlook .msg drag-drop
 
 Add vendored `lib/msgreader.min.js` (Apache 2.0, `@kenjiuno/msgreader` bundled to browser IIFE with esbuild, 611 KB). Drop handler routes `.msg` files through the library, adapts the output shape into the same `{ headers, bodyText, attachments, warnings }` structure the .eml pipeline uses, and lands on disk with the same header layout. Recipients are consolidated into To / Cc lines; the plain-text body is preferred, with HTML → text as a fallback.
