@@ -422,13 +422,68 @@ function hasFileSystemAccess() {
  * inside it. Returns an object holding the four directory handles plus
  * the top-level root handle for later re-lookup.
  */
-async function pickRoot() {
-  const root = await window.showDirectoryPicker({ mode: 'readwrite' });
+async function pickRoot(existingRoot) {
+  const root = existingRoot || await window.showDirectoryPicker({ mode: 'readwrite' });
   const activeRaw = await root.getDirectoryHandle(ROOTS.activeRaw, { create: true });
   const activeSan = await root.getDirectoryHandle(ROOTS.activeSan, { create: true });
   const closedRaw = await root.getDirectoryHandle(ROOTS.closedRaw, { create: true });
   const closedSan = await root.getDirectoryHandle(ROOTS.closedSan, { create: true });
   return { root, activeRaw, activeSan, closedRaw, closedSan };
+}
+
+/**
+ * Persist and restore the casework root DirectoryHandle in IndexedDB
+ * so the adviser does not need to grant folder access on every session.
+ * File System Access API handles are transferable to IDB; on next visit
+ * we read the handle back, then need a user gesture to call
+ * requestPermission before we can read or write.
+ */
+const HANDLE_DB_NAME = 'sanitiser-handles';
+const HANDLE_DB_STORE = 'handles';
+
+function openHandleDB() {
+  return new Promise((resolve, reject) => {
+    if (!window.indexedDB) { resolve(null); return; }
+    const req = indexedDB.open(HANDLE_DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      req.result.createObjectStore(HANDLE_DB_STORE, { keyPath: 'id' });
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function saveRootHandle(handle) {
+  try {
+    const db = await openHandleDB();
+    if (!db) return;
+    const tx = db.transaction(HANDLE_DB_STORE, 'readwrite');
+    tx.objectStore(HANDLE_DB_STORE).put({ id: 'root', handle, savedAt: new Date().toISOString() });
+    await new Promise((resolve) => { tx.oncomplete = resolve; tx.onerror = resolve; });
+  } catch (_e) { /* non-fatal */ }
+}
+
+async function loadRootHandle() {
+  try {
+    const db = await openHandleDB();
+    if (!db) return null;
+    return await new Promise((resolve) => {
+      const tx = db.transaction(HANDLE_DB_STORE, 'readonly');
+      const req = tx.objectStore(HANDLE_DB_STORE).get('root');
+      req.onsuccess = () => resolve(req.result ? req.result.handle : null);
+      req.onerror = () => resolve(null);
+    });
+  } catch (_e) { return null; }
+}
+
+async function clearRootHandle() {
+  try {
+    const db = await openHandleDB();
+    if (!db) return;
+    const tx = db.transaction(HANDLE_DB_STORE, 'readwrite');
+    tx.objectStore(HANDLE_DB_STORE).delete('root');
+    await new Promise((resolve) => { tx.oncomplete = resolve; tx.onerror = resolve; });
+  } catch (_e) { /* non-fatal */ }
 }
 
 /**
@@ -1855,6 +1910,10 @@ function openReviewDialog(entities, mapping, options = {}) {
       if (!rowEl) return;
       const idx = Number(rowEl.dataset.idx);
       updateDecisionFromRow(decisions[idx], rowEl);
+      // Any action change clears a stale "text not found" from
+      // an earlier spurious input event.
+      decisions[idx].textInvalid = false;
+      markInvalidText(rowEl, false);
       refreshRow(rowEl, decisions[idx]);
       updateSummary(modal, decisions);
     });
@@ -2089,7 +2148,7 @@ function renderRow(decision, idx) {
     : '';
   tr.innerHTML = `
     <td>
-      <input class="entity-original" style="width:100%;font-family:var(--mono);font-size:12px;padding:4px 6px;" data-role="span-text" type="text" value="${escapeHtml(decision.text)}">
+      <input class="entity-original" style="width:100%;font-family:var(--mono);font-size:12px;padding:4px 6px;" data-role="span-text" type="text" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" value="${escapeHtml(decision.text)}">
       <div class="entity-category" data-role="context" style="margin-top:2px">${escapeHtml(`${decision.contextBefore}⟨${decision.text}⟩${decision.contextAfter}`)}</div>
       <div style="margin-top:4px;display:flex;gap:4px;flex-wrap:wrap;align-items:center">
         <button type="button" data-role="safe-case" style="padding:2px 8px;font-size:11px">Safe here</button>
@@ -2159,6 +2218,15 @@ function refreshRow(rowEl, decision) {
   actionCell.innerHTML = renderActionSelect(decision);
   tokenCell.innerHTML = renderTokenControl(decision);
   if (decision.action === 'preserve') markInvalidText(rowEl, false);
+  // Backfill token from the freshly-rendered dropdown. When the user
+  // just changed action from 'unresolved' to 'tokenise', the earlier
+  // updateDecisionFromRow could not read the token select because it
+  // did not exist in the DOM yet. Adopt whatever the visible dropdown
+  // now shows as its default so the internal state matches the UI.
+  if (decision.action === 'tokenise' && !decision.token) {
+    const sel = tokenCell.querySelector('select[data-role="token"]');
+    if (sel && sel.value) decision.token = sel.value;
+  }
 }
 
 function isUnresolved(d) {
@@ -2340,6 +2408,7 @@ function init() {
     return;
   }
   document.getElementById('btn-open-root').addEventListener('click', onOpenRoot);
+  primeReopenButton();
   document.getElementById('btn-new-case').addEventListener('click', onNewCase);
   document.getElementById('btn-paste-rehydrate').addEventListener('click', onPasteRehydrate);
   document.querySelectorAll('#sidebar .tab').forEach((btn) => {
@@ -2357,18 +2426,60 @@ function init() {
 
 async function onOpenRoot() {
   try {
-    state.handles = await pickRoot();
+    const btn = document.getElementById('btn-open-root');
+    let rootHandle = null;
+    // If the button is in "reopen" mode from a previous session, try
+    // the stored handle first. This click is a user gesture, so
+    // requestPermission is allowed to prompt the OS folder-access
+    // dialog if the browser has not remembered the grant.
+    if (btn && btn.dataset.reopen === 'true') {
+      const stored = await loadRootHandle();
+      if (stored) {
+        let perm = 'prompt';
+        try { perm = await stored.queryPermission({ mode: 'readwrite' }); } catch (_e) {}
+        if (perm !== 'granted') {
+          try { perm = await stored.requestPermission({ mode: 'readwrite' }); } catch (_e) {}
+        }
+        if (perm === 'granted') rootHandle = stored;
+      }
+      // If the restore did not work, fall through to the picker below.
+      btn.dataset.reopen = '';
+    }
+    state.handles = await pickRoot(rootHandle);
+    await saveRootHandle(state.handles.root);
     state.globalSettings = await loadGlobalSettings(state.handles.root);
     state.watchlist = await loadWatchlist(state.handles.root);
-    document.getElementById('root-path').textContent = 'Casework folder ready';
+    document.getElementById('root-path').textContent = state.handles.root.name || 'Casework folder ready';
+    if (btn) { btn.textContent = 'Change folder'; }
     const toggle = document.getElementById('ner-toggle');
     toggle.checked = !!state.globalSettings.nerEnabled;
     updateNerStatus();
     await refreshCases();
   } catch (err) {
     if (err && err.name === 'AbortError') return;
+    // NotFoundError typically means the stored folder has been moved
+    // or deleted since last time. Drop the stale handle so we do not
+    // keep tripping on it.
+    if (err && (err.name === 'NotFoundError' || err.name === 'NotAllowedError')) {
+      await clearRootHandle();
+    }
     showToast(`Could not open folder: ${err.message}`, true);
   }
+}
+
+/**
+ * If a directory handle from a previous session is stored, put the
+ * Change folder button into "Reopen" mode so the first click restores
+ * the last folder rather than opening a fresh picker.
+ */
+async function primeReopenButton() {
+  const btn = document.getElementById('btn-open-root');
+  if (!btn) return;
+  const stored = await loadRootHandle();
+  if (!stored) return;
+  btn.textContent = `Reopen ${stored.name}`;
+  btn.dataset.reopen = 'true';
+  btn.title = `Restore access to ${stored.name}. Chrome will prompt once, then remember.`;
 }
 
 async function refreshCases() {
