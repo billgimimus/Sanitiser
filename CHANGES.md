@@ -45,6 +45,17 @@ Built:
 - Binary heuristic fallback for files with unfamiliar extensions: if the first kilobyte contains more than 5% control characters (excluding tab, CR, LF), the file is treated as unsupported.
 - Audit log now records paste-text events with the optional source note.
 
+## Phase 3.3: compliance patch alignment + token highlighting
+
+Apply the six changes from the Compliance Alignment patch note plus a requested review-aid.
+
+- **`TOOL_VERSION` constant**, written into every sanitised file's header block (`# Tool version: 1.0`) and recorded on every audit line. A future bug in a specific vintage can be traced to affected files.
+- **Startup self-test.** On launch, the tool sanitises a fixture, verifies raw identifiers (email, phone, NI) do not appear in the output, rehydrates, and byte-checks the originals return. Any failure blocks init: the Open button disables, a red banner names the failure. No processing until the sanitiser is proven working.
+- **Special-category detection.** Six keyword pattern sets for health, ethnicity, sexuality, religion, trade union membership, and criminal offence data. When any fire in a document, an amber banner appears at the top of the review dialog naming which categories were seen. At export the adviser is shown a confirmation prompt naming the categories and sample keywords: "Sanitisation complete, export" vs "Cancel export". Both outcomes go to the audit log. The header block on the sanitised file records the flags. This is a friction point, not a block; Article 9 data is often essential to the casework.
+- **Enriched audit log.** Every sanitise line now records the tool version, decision counts, mapping updates, auto-applied count, safe-list additions, verbatim block count, watchlist additions, and special-category flags. Cancellation of a special-category confirmation also logs.
+- **About panel.** Wired to the Help icon in the left rail. Modal names the tool version, describes the pseudonymisation guarantee, lists the residual risks and what the tool does not do, and includes the compliance boundary statement. An **Export as plain text** button downloads the same content as a `.txt` so it can be shared with Information Governance without a screenshot.
+- **Token highlighting on Original and Sanitised tabs.** The Original tab wraps every mapping entry's text (and its aliases) in a `<mark>` with a tooltip naming the token it will become. The Sanitised tab wraps every `[TOKEN]` with a tooltip naming the original identifier. Unmapped tokens get a distinct dashed style so unknowns stand out. Makes review at a glance far faster.
+
 ## Phase 3.2: full-text search, mapping editor with propagation, diff view
 
 The remaining three phase 3 items.

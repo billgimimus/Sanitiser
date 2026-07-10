@@ -16,6 +16,13 @@
   // Signal to the fallback banner in index.html that the script did load.
   window.__sanitiserLoaded = true;
 
+  // Version-tag written into every sanitised file's header block, exposed
+  // in the About panel, and recorded in the audit log for every action.
+  // Bump when a shipped change alters detection, tokenisation, rehydration
+  // or the on-disk format, so a later bug can be traced back to a specific
+  // vintage of tool output.
+  const TOOL_VERSION = '1.0';
+
 
 // =====================================================================
 // js/roles.js
@@ -1264,7 +1271,7 @@ function applySanitisation(text, decisions) {
   return out;
 }
 
-function buildHeader({ caseId, sourceName, tokensUsed, sanitisedDateISO, verbatimCount }) {
+function buildHeader({ caseId, sourceName, tokensUsed, sanitisedDateISO, verbatimCount, specialCategoryFlags }) {
   const uniqueTokens = Array.from(new Set(tokensUsed)).sort();
   const dateLabel = formatDate(sanitisedDateISO);
   const lines = [
@@ -1272,10 +1279,14 @@ function buildHeader({ caseId, sourceName, tokensUsed, sanitisedDateISO, verbati
     `# Case: ${caseId}`,
     `# Source: ${sourceName}`,
     `# Sanitised: ${dateLabel}`,
+    `# Tool version: ${TOOL_VERSION}`,
     `# Tokens: ${uniqueTokens.join(' ') || '(none)'}`,
   ];
   if (verbatimCount) {
     lines.push(`# Verbatim blocks: ${verbatimCount} (must be reproduced without alteration between <verbatim-referral> tags)`);
+  }
+  if (specialCategoryFlags && specialCategoryFlags.length) {
+    lines.push(`# Special category signals: ${specialCategoryFlags.join(', ')} (UK GDPR Article 9). Adviser confirmed sanitisation before export.`);
   }
   lines.push('# This block must be removed before use in client-facing systems.', HEADER_END, '');
   return lines.join('\n');
@@ -1936,6 +1947,7 @@ function openReviewDialog(entities, mapping, options = {}) {
       <div class="modal-header">Review detected entities: ${escapeHtml(options.title || 'file')}</div>
       <div class="modal-body">
         ${renderPriorAppearanceBanner(options.priorSummary)}
+        ${renderSpecialCategoryBanner(options.specialCategoryFlags)}
         ${options.autoAppliedCount ? `<div class="muted" style="background:var(--panel-alt);border:1px solid var(--border);border-radius:4px;padding:8px 12px;margin-bottom:10px;">${options.autoAppliedCount} identifier${options.autoAppliedCount === 1 ? '' : 's'} already in this case's mapping will be tokenised automatically. They are not shown below.</div>` : ''}
         <p class="muted">The detected text on the left is editable, so you can trim a wrongly captured boundary (for example changing "Hi Kieran" to "Kieran"). Use "Safe here" or "Safe everywhere" to record that a specific string should be skipped by future detection.</p>
         <div id="review-summary" class="muted" style="margin-bottom:8px"></div>
@@ -2127,6 +2139,16 @@ function findClosestOccurrence(haystack, needle, origStart, origEnd) {
  * conflicts policy. Shelter's substantive conflict rules govern the
  * actual decision.
  */
+function renderSpecialCategoryBanner(flags) {
+  if (!flags || !flags.length) return '';
+  const labels = flags.map((f) => (SPECIAL_CATEGORY_LABELS[f.category] || f.category)).join(', ');
+  return `
+    <div class="integrity-block">
+      <strong>Special category signals detected: ${escapeHtml(labels)}.</strong>
+      Under UK GDPR Article 9 this is a heightened-risk category. Review with extra care. On export you will be asked to confirm the sanitisation is complete for this content; the confirmation is recorded in the case audit log.
+    </div>`;
+}
+
 function renderPriorAppearanceBanner(summary) {
   if (!summary) return '';
   const rows = summary.cases.map((c) => {
@@ -2458,10 +2480,34 @@ const state = {
 
 document.addEventListener('DOMContentLoaded', init);
 
+/**
+ * Refuse to open when the startup self-test fails. Disables the primary
+ * action button and shows a red banner naming the failure so the
+ * adviser cannot start processing casework with a broken vintage.
+ */
+function blockOnSelfTestFailure(err) {
+  const btn = document.getElementById('btn-open-root');
+  if (btn) { btn.disabled = true; btn.textContent = 'Tool blocked'; }
+  const welcome = document.getElementById('welcome');
+  if (welcome) {
+    const banner = document.createElement('div');
+    banner.className = 'error';
+    banner.style.marginBottom = '12px';
+    banner.innerHTML = `<strong>Startup self-test failed.</strong> The tool refuses to open because sanitisation is not operating correctly. Reload after replacing js/app.js with a known-good version, or run <code>git pull</code> and hard-refresh.<br>Reason: ${escapeHtml(err && err.message ? err.message : String(err))}.`;
+    welcome.prepend(banner);
+  }
+}
+
 function init() {
   if (!hasFileSystemAccess()) {
     document.getElementById('browser-warning').hidden = false;
     document.getElementById('btn-open-root').disabled = true;
+    return;
+  }
+  try {
+    runSanitiserSelfTest();
+  } catch (err) {
+    blockOnSelfTestFailure(err);
     return;
   }
   document.getElementById('btn-open-root').addEventListener('click', onOpenRoot);
@@ -2472,6 +2518,8 @@ function init() {
   if (refreshBtn) refreshBtn.addEventListener('click', onRefreshCases);
   const searchBtn = document.getElementById('btn-search');
   if (searchBtn) searchBtn.addEventListener('click', onOpenSearch);
+  const helpRailBtn = document.querySelector('.icon-rail-item[title="Help"]');
+  if (helpRailBtn) helpRailBtn.addEventListener('click', openAboutPanel);
   document.querySelectorAll('#sidebar .tab').forEach((btn) => {
     btn.addEventListener('click', () => switchSidebarView(btn.dataset.view));
   });
@@ -3157,11 +3205,11 @@ function renderFileView(name, caseObj, text, sanitisedText) {
   document.getElementById('file-name').textContent = name;
   document.getElementById('file-case').textContent = `Case ${caseObj.id}`;
   const pre = document.getElementById('original-content');
-  pre.innerHTML = '';
-  pre.textContent = text;
-  document.getElementById('sanitised-content').textContent = sanitisedText || '';
+  pre.innerHTML = renderHighlightedOriginalHtml(text || '', state.currentMapping);
+  const sanEl = document.getElementById('sanitised-content');
+  sanEl.innerHTML = renderHighlightedSanitisedHtml(sanitisedText || '', state.currentMapping);
   document.getElementById('sanitised-status').textContent = sanitisedText
-    ? 'This file has been sanitised.'
+    ? 'This file has been sanitised. Highlighted tokens: hover to see the original identifier they replaced.'
     : 'This file has not been sanitised yet. Click "Sanitise this file" to review detected entities.';
   const stale = sanitisedText && state.currentOriginalMtime > state.currentSanitisedMtime;
   document.getElementById('stale-warning').hidden = !stale;
@@ -3234,6 +3282,331 @@ function renderDiffView() {
   status.textContent = parts2.join(', ') + '.';
 }
 
+// =====================================================================
+// compliance patch: self-test, special category, About, highlighting
+// =====================================================================
+
+/**
+ * Startup self-test. Sanitises a built-in fixture, verifies the raw
+ * identifiers do not appear in the output, rehydrates, and confirms
+ * the originals return. Any failure aborts init: the tool refuses to
+ * open and shows the error, so a broken vintage can never quietly
+ * process real casework.
+ */
+function runSanitiserSelfTest() {
+  const input = 'Contact test.person@example.com or 07700 900123. NI: JT 12 34 56 A.';
+  const mapping = {
+    version: 1,
+    entries: [
+      { original: 'test.person@example.com', token: "[CL'S EMAIL]", category: 'email' },
+      { original: '07700 900123', token: "[CL'S PHONE]", category: 'phone' },
+      { original: 'JT 12 34 56 A', token: '[NI NUMBER]', category: 'ni_number' },
+    ],
+    safeList: [],
+  };
+  const detected = detectEntities(input, mapping, new Set());
+  if (!detected.length) throw new Error('detection returned no entities');
+  const decisions = detected.map((e) => (e.known
+    ? { ...e, action: 'tokenise', token: e.known.token }
+    : { ...e, action: 'preserve' }));
+  const sanitised = applySanitisation(input, decisions);
+  if (sanitised.includes('test.person@example.com')) throw new Error('email leaked into sanitised output');
+  if (sanitised.includes('07700 900123')) throw new Error('phone leaked into sanitised output');
+  if (sanitised.includes('JT 12 34 56 A')) throw new Error('NI number leaked into sanitised output');
+  const { replaced } = rehydrate(sanitised, mapping);
+  if (!replaced.includes('test.person@example.com')) throw new Error('rehydration failed to restore email');
+  if (!replaced.includes('07700 900123')) throw new Error('rehydration failed to restore phone');
+  if (!replaced.includes('JT 12 34 56 A')) throw new Error('rehydration failed to restore NI');
+  return true;
+}
+
+/**
+ * Detect signals that the material contains UK GDPR Article 9 special
+ * category data: health, ethnicity, sexuality, religion, trade union
+ * membership, criminal offence data. This is deliberately noisy - the
+ * point is friction, not a block. The consequence of a sanitisation
+ * failure on this category of data is materially more serious, so the
+ * adviser is asked to confirm at export.
+ */
+const SPECIAL_CATEGORY_PATTERNS = {
+  health: /\b(mental\s+health|depression|anxiety|PTSD|self[-\s]?harm|suicid(?:e|al|ality)|disab(?:led|ility)|impairment|cancer|diabet(?:es|ic)|HIV|AIDS|epilep(?:sy|tic)|dementia|autis(?:m|tic)|ADHD|OCD|schizophreni(?:a|c)|bipolar|psychosis|medication|prescrib(?:ed|ing)|therap(?:y|ist)|GP|(?:mental\s+)?health\s+practitioner|hospital|chronic|illness|(?:hospital\s+)?admission|drug\s+use|substance\s+misuse|addiction)\b/gi,
+  ethnicity: /\b(ethnicity|black\s+british|african|caribbean|mixed\s+(?:heritage|race)|south\s+asian|roma|traveller|gypsy|somali|kurdish|refugee\s+status|asylum\s+seeker|indefinite\s+leave|BRP|nationality)\b/gi,
+  sexuality: /\b(gay|lesbian|bisexual|trans(?:gender|sexual)?|non[-\s]?binary|LGBT(?:Q\+?)?|homosexual|same[-\s]sex|sexual\s+orientation|coming\s+out|homophobi(?:a|c))\b/gi,
+  religion: /\b(muslim|islamic|jewish|hindu|sikh|buddhist|christian|catholic|protestant|orthodox|atheist|agnostic|religion|religious\s+belief|mosque|synagogue|church|temple|gurdwara|faith|ramadan|shabbat)\b/gi,
+  trade_union: /\b(trade\s+union|unions?\s+member(?:ship)?|shop\s+steward|union\s+rep(?:resentative)?)\b/gi,
+  criminal_offence: /\b(convict(?:ed|ion|ions)|arrest(?:ed)?|prison|imprisoned|custody|probation|police\s+caution|criminal\s+record|criminal\s+offence|prosecution|charged\s+with|remand(?:ed)?|magistrat|crown\s+court|sentence(?:d)?|CRB|DBS|Rehabilitation\s+of\s+Offenders)\b/gi,
+};
+
+function detectSpecialCategorySignals(text) {
+  const flags = [];
+  for (const [name, rx] of Object.entries(SPECIAL_CATEGORY_PATTERNS)) {
+    const hits = text.match(rx);
+    if (hits && hits.length) {
+      const sample = Array.from(new Set(hits.map((h) => h.toLowerCase()))).slice(0, 5);
+      flags.push({ category: name, hits: hits.length, sample });
+    }
+  }
+  return flags;
+}
+
+const SPECIAL_CATEGORY_LABELS = {
+  health: 'health',
+  ethnicity: 'ethnicity',
+  sexuality: 'sexuality',
+  religion: 'religion',
+  trade_union: 'trade union membership',
+  criminal_offence: 'criminal offence',
+};
+
+function summariseSpecialCategoryFlags(flags) {
+  return flags.map((f) => SPECIAL_CATEGORY_LABELS[f.category] || f.category);
+}
+
+/**
+ * Confirmation prompt shown before writing the sanitised file when
+ * special category signals were detected. Not a block - Article 9 data
+ * is often essential to the casework - but a friction point that
+ * ensures the adviser has actively considered whether the sanitisation
+ * done above is adequate for this specific content.
+ */
+function confirmSpecialCategoryExport(flags) {
+  return new Promise((resolve) => {
+    const root = document.getElementById('dialog-root');
+    root.innerHTML = '';
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop';
+    const modal = document.createElement('div');
+    modal.className = 'modal';
+    modal.style.width = '640px';
+    backdrop.appendChild(modal);
+    const labels = summariseSpecialCategoryFlags(flags);
+    const samples = flags.map((f) => `<li><strong>${escapeHtml(SPECIAL_CATEGORY_LABELS[f.category] || f.category)}</strong> - ${f.hits} match${f.hits === 1 ? '' : 'es'}: ${escapeHtml(f.sample.join(', '))}</li>`).join('');
+    modal.innerHTML = `
+      <div class="modal-header">Special category data present</div>
+      <div class="modal-body">
+        <p>This material contains signals of <strong>${escapeHtml(labels.join(', '))}</strong>. Under UK GDPR Article 9 this is special category data. The consequence of a sanitisation failure on this content is materially more serious than a failure on ordinary casework.</p>
+        <p><strong>Confirm sanitisation is complete and no identifying details remain attached to this content.</strong></p>
+        <ul style="font-size:12px;">${samples}</ul>
+        <p class="muted">This confirmation is recorded in the case audit log.</p>
+      </div>
+      <div class="modal-footer">
+        <button data-action="cancel">Cancel export</button>
+        <button class="primary" data-action="confirm">Sanitisation complete, export</button>
+      </div>
+    `;
+    root.appendChild(backdrop);
+    modal.addEventListener('click', (ev) => {
+      const a = ev.target.dataset && ev.target.dataset.action;
+      if (a === 'cancel' || a === 'confirm') {
+        backdrop.remove();
+        resolve(a === 'confirm');
+      }
+    });
+  });
+}
+
+/**
+ * About panel. Documents the tool as required by the compliance patch:
+ * what it does, its guarantee, residual risks, what it does not do,
+ * compliance boundary. Content is exportable as a plain-text document
+ * so it can be shared with Information Governance without needing
+ * a screenshot of the tool.
+ */
+function openAboutPanel() {
+  const root = document.getElementById('dialog-root');
+  root.innerHTML = '';
+  const backdrop = document.createElement('div');
+  backdrop.className = 'modal-backdrop';
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+  modal.style.width = '720px';
+  backdrop.appendChild(modal);
+  const body = aboutTextBody();
+  modal.innerHTML = `
+    <div class="modal-header">About this tool</div>
+    <div class="modal-body">
+      ${body}
+    </div>
+    <div class="modal-footer">
+      <button data-action="export">Export as plain text</button>
+      <button class="primary" data-action="ok">Close</button>
+    </div>
+  `;
+  root.appendChild(backdrop);
+  modal.addEventListener('click', (ev) => {
+    const a = ev.target.dataset && ev.target.dataset.action;
+    if (a === 'ok') backdrop.remove();
+    if (a === 'export') exportAboutText();
+  });
+}
+
+function aboutTextBody() {
+  return `
+    <p><strong>Casework Sanitisation Tool</strong> · version ${TOOL_VERSION}</p>
+    <h3 style="font-size:14px;margin-top:16px;">What this tool does</h3>
+    <p>Pseudonymises housing casework material before it leaves this machine. It sits between the case file and an external AI service, replacing real identifiers with role-based tokens (for example, "Ms Anna Kowalski" becomes "[CL_1]"). The adviser reviews every replacement. Sanitised output is copied to the clipboard for pasting into the AI service. The AI's response is pasted back and the tokens are converted back to real identifiers before it reaches a client-facing system.</p>
+    <h3 style="font-size:14px;margin-top:16px;">The pseudonymisation guarantee</h3>
+    <p>Identifying data does not reach the external AI service. The tool refuses to export a sanitised file if any real identifier from the case's mapping is still present in the output. On rehydration, a reverse check scans the pasted AI reply for real identifiers that may have leaked; matches are surfaced to the adviser before rehydration completes. A startup self-test runs sanitise-then-rehydrate on a built-in fixture at every launch; a failure blocks the tool from opening.</p>
+    <h3 style="font-size:14px;margin-top:16px;">Residual risks</h3>
+    <ul>
+      <li>Adviser error in the review step. The tool detects candidates; the adviser decides. A wrong decision at review propagates into the sanitised output.</li>
+      <li>Named-entity recognition model limitations. The optional NER layer improves detection of names the regex layer misses but is known to be weaker on non-Western names.</li>
+      <li>Dependency on the mapping being correct. If the mapping is edited to remove an entry, existing sanitised text keeps the token but rehydration cannot restore the original.</li>
+      <li>Special category data. The tool flags it and asks for confirmation but does not treat it differently at the technical level.</li>
+    </ul>
+    <h3 style="font-size:14px;margin-top:16px;">What this tool does not do</h3>
+    <ul>
+      <li>It is not a legal opinion.</li>
+      <li>It is not an authorisation for AI-assisted casework. Whether the adviser's use of AI has been sanctioned by Shelter is a separate question.</li>
+      <li>It is not a substitute for professional judgement about what may or may not be shared with an external system.</li>
+    </ul>
+    <h3 style="font-size:14px;margin-top:16px;">Compliance boundary</h3>
+    <p>The tool addresses the technical question of preventing identifying data reaching an external AI service. It does not, and cannot, address:</p>
+    <ul>
+      <li>Whether Shelter has sanctioned the use of external AI tools for casework support.</li>
+      <li>Whether the AI Governance Group has assessed the specific AI service in use.</li>
+      <li>Whether the client privacy notice needs to reference AI-assisted casework processing.</li>
+      <li>Whether the adviser's use of the tool has been disclosed to line management.</li>
+    </ul>
+    <p>These questions sit outside the tool's scope. The adviser is responsible for handling them through the appropriate organisational channels.</p>
+    <h3 style="font-size:14px;margin-top:16px;">Data on this machine</h3>
+    <p>All persistent state is on the local filesystem. Nothing is transmitted anywhere by the tool itself. The only outbound flow is the adviser's deliberate act of copying sanitised text to an external AI service.</p>
+    <p class="muted" style="font-size:11px;margin-top:20px;">Version ${TOOL_VERSION}. Last updated automatically on every code change.</p>
+  `;
+}
+
+function exportAboutText() {
+  const text = aboutPlainText();
+  const blob = new Blob([text], { type: 'text/plain' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `casework-sanitiser-about-v${TOOL_VERSION}.txt`;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 0);
+}
+
+function aboutPlainText() {
+  return [
+    `Casework Sanitisation Tool - version ${TOOL_VERSION}`,
+    '',
+    'WHAT THIS TOOL DOES',
+    'Pseudonymises housing casework material before it leaves this machine. It sits between the case file and an external AI service, replacing real identifiers with role-based tokens. The adviser reviews every replacement. Sanitised output is copied to the clipboard for pasting into the AI service. The AI reply is pasted back and tokens are converted back to real identifiers before reaching a client-facing system.',
+    '',
+    'THE PSEUDONYMISATION GUARANTEE',
+    'Identifying data does not reach the external AI service. The tool refuses to export a sanitised file if any real identifier from the case mapping is still present in the output. On rehydration, a reverse check scans the pasted AI reply for real identifiers that may have leaked; matches are surfaced to the adviser before rehydration completes. A startup self-test runs sanitise-then-rehydrate on a built-in fixture at every launch; a failure blocks the tool from opening.',
+    '',
+    'RESIDUAL RISKS',
+    '- Adviser error in the review step. The tool detects candidates; the adviser decides.',
+    '- NER model limitations - weaker on non-Western names.',
+    '- Dependency on the mapping being correct.',
+    '- Special category data is flagged with confirmation but not technically treated differently.',
+    '',
+    'WHAT THIS TOOL DOES NOT DO',
+    '- It is not a legal opinion.',
+    '- It is not an authorisation for AI-assisted casework.',
+    '- It is not a substitute for professional judgement.',
+    '',
+    'COMPLIANCE BOUNDARY',
+    'The tool addresses the technical question of preventing identifying data reaching an external AI service. It does not, and cannot, address:',
+    '- Whether Shelter has sanctioned the use of external AI tools for casework support.',
+    '- Whether the AI Governance Group has assessed the specific AI service in use.',
+    '- Whether the client privacy notice needs to reference AI-assisted casework processing.',
+    '- Whether the adviser\'s use of the tool has been disclosed to line management.',
+    '',
+    'DATA ON THIS MACHINE',
+    'All persistent state is on the local filesystem. Nothing is transmitted anywhere by the tool itself. The only outbound flow is the adviser\'s deliberate act of copying sanitised text to an external AI service.',
+    '',
+    `Version ${TOOL_VERSION}.`,
+  ].join('\n');
+}
+
+/**
+ * Wrap every occurrence of a mapping entry's original text (and its
+ * aliases) in a highlighted <mark> so the adviser can see at a glance
+ * which parts of the raw text are already tokenised in the mapping.
+ * Longest strings match first so shorter aliases never chew into
+ * longer names.
+ */
+function renderHighlightedOriginalHtml(text, mapping) {
+  const entries = (mapping && mapping.entries) || [];
+  const needles = [];
+  for (const e of entries) {
+    if (e.original) needles.push({ needle: e.original, token: e.token, kind: 'original' });
+    for (const a of (e.aliases || [])) {
+      if (a) needles.push({ needle: a, token: e.token, kind: 'alias' });
+    }
+  }
+  needles.sort((a, b) => b.needle.length - a.needle.length);
+  return highlightWithNeedles(text, needles);
+}
+
+function highlightWithNeedles(text, needles) {
+  if (!text) return '';
+  if (!needles.length) return escapeHtml(text);
+  const matches = [];
+  for (const n of needles) {
+    if (!n.needle) continue;
+    const escaped = n.needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const rx = new RegExp(escaped, 'gi');
+    let m;
+    while ((m = rx.exec(text)) !== null) {
+      matches.push({ start: m.index, end: m.index + m[0].length, match: m[0], token: n.token, kind: n.kind });
+      if (matches.length > 5000) break;
+    }
+    if (matches.length > 5000) break;
+  }
+  matches.sort((a, b) => a.start - b.start || (b.end - b.start) - (a.end - a.start));
+  const chosen = [];
+  let cursor = -1;
+  for (const m of matches) {
+    if (m.start < cursor) continue;
+    chosen.push(m);
+    cursor = m.end;
+  }
+  let out = '';
+  let last = 0;
+  for (const c of chosen) {
+    out += escapeHtml(text.slice(last, c.start));
+    const title = `will become: ${c.token}${c.kind === 'alias' ? ' (alias)' : ''}`;
+    out += `<mark title="${escapeHtml(title)}" style="background:var(--warning-bg);color:var(--warning-text-strong);padding:0 3px;border-radius:2px;">${escapeHtml(c.match)}</mark>`;
+    last = c.end;
+  }
+  out += escapeHtml(text.slice(last));
+  return out;
+}
+
+/**
+ * Wrap every [TOKEN] occurrence in the sanitised text with a highlighted
+ * <mark>. Hovering shows the original identifier from the mapping.
+ * Unmapped tokens (dashed border) stand out so it is obvious which
+ * would not rehydrate.
+ */
+function renderHighlightedSanitisedHtml(text, mapping) {
+  if (!text) return '';
+  const tokenIndex = new Map();
+  for (const e of (mapping && mapping.entries) || []) {
+    if (e.token) tokenIndex.set(e.token, e.original || '');
+  }
+  const rx = /\[[A-Z0-9'\/ _\-.]+?\]/g;
+  let out = '';
+  let last = 0;
+  let m;
+  while ((m = rx.exec(text)) !== null) {
+    out += escapeHtml(text.slice(last, m.index));
+    const original = tokenIndex.get(m[0]);
+    if (original) {
+      out += `<mark title="${escapeHtml('was: ' + original)}" style="background:var(--warning-bg);color:var(--warning-text-strong);padding:0 3px;border-radius:2px;">${escapeHtml(m[0])}</mark>`;
+    } else {
+      out += `<mark title="Token not in this case\'s mapping" style="background:var(--panel-sunken);color:var(--muted);border:1px dashed var(--border-strong);padding:0 3px;border-radius:2px;">${escapeHtml(m[0])}</mark>`;
+    }
+    last = m.index + m[0].length;
+  }
+  out += escapeHtml(text.slice(last));
+  return out;
+}
+
 async function onSanitise() {
   const c = state.cases.find((x) => x.id === state.selectedCaseId);
   if (!c || !state.selectedFile) return;
@@ -3260,11 +3633,13 @@ async function onSanitise() {
   const knownEntities = entities.filter((e) => e.known && e.known.token);
   const unknownEntities = entities.filter((e) => !e.known || !e.known.token);
   const priorSummary = summarisePriorAppearances(entities);
+  const earlySpecialFlags = detectSpecialCategorySignals(state.currentText);
   const result = await openReviewDialog(unknownEntities, mapping, {
     title: state.selectedFile,
     documentText: state.currentText,
     priorSummary,
     autoAppliedCount: knownEntities.length,
+    specialCategoryFlags: earlySpecialFlags,
   });
   if (!result) return;
   for (const upd of result.mappingUpdates) {
@@ -3293,12 +3668,23 @@ async function onSanitise() {
     showToast(`Sanitisation blocked. ${offenders.length} real identifier${offenders.length === 1 ? '' : 's'} still present: ${offenders.map((o) => o.original).join(', ')}`, true);
     return;
   }
+  const specialFlags = detectSpecialCategorySignals(state.currentText);
+  if (specialFlags.length) {
+    const proceed = await confirmSpecialCategoryExport(specialFlags);
+    if (!proceed) {
+      showToast('Export cancelled by adviser after special-category confirmation prompt.', true);
+      await appendAudit(c.rawHandle, `Special-category export cancelled by adviser: ${summariseSpecialCategoryFlags(specialFlags).join(', ')}`);
+      return;
+    }
+    await appendAudit(c.rawHandle, `Special-category confirmed by adviser: ${summariseSpecialCategoryFlags(specialFlags).join(', ')}`);
+  }
   const header = buildHeader({
     caseId: c.id,
     sourceName: state.selectedFile,
     tokensUsed: allDecisions.filter((d) => d.action === 'tokenise').map((d) => d.token),
     sanitisedDateISO: new Date().toISOString(),
     verbatimCount: verbatimIds.length,
+    specialCategoryFlags: summariseSpecialCategoryFlags(specialFlags),
   });
   const output = header + sanitised;
   await writeFileText(c.sanHandle, state.selectedFile, output);
@@ -3308,7 +3694,8 @@ async function onSanitise() {
   const verbatimAudit = verbatimIds.length ? `; ${verbatimIds.length} verbatim block(s)` : '';
   const watchlistAudit = added ? `; ${added} new watchlist entrie(s)` : '';
   const autoNote = autoDecisions.length ? `; ${autoDecisions.length} auto-applied from mapping` : '';
-  await appendAudit(c.rawHandle, `Sanitised: ${state.selectedFile} (${result.decisions.length} reviewed decisions, ${result.mappingUpdates.length} new mapping entries)${autoNote}${safeAudit ? `; ${safeAudit}` : ''}${verbatimAudit}${watchlistAudit}`);
+  const specialAudit = specialFlags.length ? `; special-category signals: ${summariseSpecialCategoryFlags(specialFlags).join(', ')}` : '';
+  await appendAudit(c.rawHandle, `Sanitised (v${TOOL_VERSION}): ${state.selectedFile} (${result.decisions.length} reviewed decisions, ${result.mappingUpdates.length} new mapping entries)${autoNote}${safeAudit ? `; ${safeAudit}` : ''}${verbatimAudit}${watchlistAudit}${specialAudit}`);
   state.currentMapping = mapping;
   await selectFile(state.selectedFile);
   showToast(verbatimIds.length ? `Sanitised file written with ${verbatimIds.length} verbatim block(s).` : 'Sanitised file written.');
