@@ -1,0 +1,235 @@
+/* Layout and base. Kept minimal; visual hierarchy comes from spacing not colour. */
+
+:root {
+  --bg: #f7f7f5;
+  --panel: #ffffff;
+  --border: #d8d6d0;
+  --text: #1a1a1a;
+  --muted: #6b6b6b;
+  --accent: #2a5d84;
+  --accent-text: #ffffff;
+  --warning-bg: #fff4e0;
+  --warning-border: #e0a13a;
+  --warning-text: #7a4b00;
+  --error-bg: #fde6e6;
+  --error-border: #c94a4a;
+  --error-text: #7a1a1a;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  font-family: var(--sans);
+  color: var(--text);
+  background: var(--bg);
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+#app {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  height: 100vh;
+}
+
+#topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 16px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  gap: 16px;
+}
+
+.brand {
+  font-weight: 600;
+  font-size: 15px;
+}
+
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+#main {
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  min-height: 0;
+}
+
+#sidebar {
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.sidebar-section {
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.sidebar-tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+
+.sidebar-actions {
+  display: flex;
+  gap: 4px;
+}
+
+.sidebar-actions button {
+  flex: 1;
+}
+
+.case-list {
+  padding: 4px 0;
+}
+
+.case-item {
+  padding: 8px 12px;
+  cursor: pointer;
+  border-bottom: 1px solid transparent;
+}
+
+.case-item:hover {
+  background: #eee;
+}
+
+.case-item.selected {
+  background: #e2eaf2;
+}
+
+.case-item .case-id {
+  font-weight: 600;
+}
+
+.case-item .case-meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.case-files {
+  padding: 4px 0 4px 16px;
+}
+
+.file-item {
+  padding: 4px 12px;
+  cursor: pointer;
+  font-size: 13px;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.file-item:hover {
+  background: #eee;
+}
+
+.file-item.selected {
+  background: #e2eaf2;
+}
+
+.file-item .file-badge {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: #e6e6e6;
+  color: var(--muted);
+}
+
+.file-item .file-badge.done {
+  background: #d8ecd6;
+  color: #2a5a1e;
+}
+
+.file-item .file-badge.stale {
+  background: #ffe0b3;
+  color: #7a4b00;
+}
+
+#workarea {
+  overflow: auto;
+  padding: 16px 24px;
+}
+
+.welcome {
+  max-width: 720px;
+}
+
+.welcome h1 {
+  font-size: 20px;
+  margin-top: 0;
+}
+
+.welcome ol {
+  padding-left: 20px;
+}
+
+.welcome li {
+  margin-bottom: 8px;
+}
+
+.file-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+
+.file-name {
+  font-weight: 600;
+  font-size: 16px;
+}
+
+.file-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 12px;
+}
+
+.tab-panel pre {
+  font-family: var(--mono);
+  font-size: 13px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  padding: 12px;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  margin: 0;
+  min-height: 300px;
+}
+
+.muted { color: var(--muted); font-size: 12px; }
+.warning {
+  background: var(--warning-bg);
+  border: 1px solid var(--warning-border);
+  color: var(--warning-text);
+  padding: 8px 12px;
+  border-radius: 4px;
+  margin-bottom: 12px;
+}
+.error {
+  background: var(--error-bg);
+  border: 1px solid var(--error-border);
+  color: var(--error-text);
+  padding: 8px 12px;
+  border-radius: 4px;
+}

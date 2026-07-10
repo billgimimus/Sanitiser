@@ -1,0 +1,216 @@
+/* Buttons, dialogs, tabs, toasts. Kept together so styling stays consistent. */
+
+button {
+  font: inherit;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  border-radius: 4px;
+  cursor: pointer;
+  color: inherit;
+}
+
+button:hover:not(:disabled) {
+  background: #eee;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+button.primary {
+  background: var(--accent);
+  color: var(--accent-text);
+  border-color: var(--accent);
+}
+
+button.primary:hover:not(:disabled) {
+  background: #23506f;
+}
+
+button.danger {
+  background: var(--error-bg);
+  border-color: var(--error-border);
+  color: var(--error-text);
+}
+
+.tab {
+  padding: 6px 14px;
+  border: 1px solid transparent;
+  border-bottom: none;
+  background: transparent;
+  cursor: pointer;
+  border-radius: 4px 4px 0 0;
+  color: var(--muted);
+}
+
+.tab.active {
+  background: var(--panel);
+  border-color: var(--border);
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* Modal */
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(20, 20, 20, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.modal {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  min-width: 480px;
+  max-width: 90vw;
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);
+}
+
+.modal-header {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+}
+
+.modal-body {
+  padding: 12px 16px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.modal-footer {
+  padding: 12px 16px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.form-row {
+  margin-bottom: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.form-row label {
+  font-weight: 500;
+  font-size: 12px;
+}
+
+.form-row input,
+.form-row select,
+.form-row textarea {
+  padding: 6px 8px;
+  font: inherit;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+  color: inherit;
+}
+
+.entity-table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 13px;
+}
+
+.entity-table th,
+.entity-table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.entity-table th {
+  background: #f0eee9;
+  font-weight: 600;
+  position: sticky;
+  top: 0;
+}
+
+.entity-table select,
+.entity-table input {
+  width: 100%;
+  padding: 4px 6px;
+  font: inherit;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.entity-original {
+  font-family: var(--mono);
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.entity-category {
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.chip {
+  display: inline-block;
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 8px;
+  background: #e6e6e6;
+  color: var(--muted);
+  margin-right: 4px;
+}
+
+.chip.flag {
+  background: var(--warning-bg);
+  color: var(--warning-text);
+  border: 1px solid var(--warning-border);
+}
+
+.toast {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  background: var(--text);
+  color: #fff;
+  padding: 10px 16px;
+  border-radius: 4px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  z-index: 200;
+  max-width: 400px;
+  font-size: 13px;
+}
+
+.toast.error {
+  background: var(--error-text);
+}
+
+.integrity-block {
+  background: var(--warning-bg);
+  border: 1px solid var(--warning-border);
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  border-radius: 4px;
+  color: var(--warning-text);
+}
+
+.integrity-block ul {
+  margin: 4px 0 8px 20px;
+  padding: 0;
+}
+
+.integrity-block li {
+  font-family: var(--mono);
+  font-size: 12px;
+}
