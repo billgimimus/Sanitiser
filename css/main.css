@@ -334,6 +334,7 @@ code {
 .sidebar-actions {
   display: flex;
   gap: 4px;
+  flex-wrap: wrap;
 }
 
 .sidebar-tabs {
@@ -530,6 +531,7 @@ code {
   display: flex;
   gap: 6px;
   flex-shrink: 0;
+  flex-wrap: wrap;
 }
 
 .tabs {

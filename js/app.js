@@ -137,6 +137,7 @@ const CATEGORY_LABELS = {
   address_line: 'Address line',
   currency: 'Currency amount (preserved)',
   date: 'Date (preserved)',
+  url: 'URL (review)',
   custom: 'Custom',
 };
 
@@ -147,6 +148,7 @@ const CATEGORY_LABELS = {
 const JUDGEMENT_CATEGORIES = new Set([
   'name_possible',
   'address_line',
+  'url',
 ]);
 
 /**
@@ -294,6 +296,15 @@ const NAME_PLAIN = /\b[A-Z][a-z]+(?:[- ][A-Z][a-z]+)+\b/g;
 const SALUTATION_NAME = /\b(?:Kind\s+regards|Kindest\s+regards|Best\s+regards|Best\s+wishes|Warmest\s+regards|Thank\s+you|Many\s+thanks|Hi|Hello|Hey|Cheers|Best|Thanks|Dear|Yours|Regards|Warmest|Warm|Attn|FAO|Sincerely|Faithfully)[,;:.]?\s+([A-Z][a-z]+(?:[- ][A-Z][a-z]+)*)/g;
 
 /**
+ * URLs, including domain-only forms like www.natwest.co.uk. Captured
+ * whole so the review dialog can offer to tokenise the entire URL when
+ * the organisation name is embedded in it (e.g. a mortgage lender's
+ * homepage). Trailing punctuation (.,;:) is trimmed off matches so a
+ * URL at the end of a sentence does not include the full stop.
+ */
+const URL_PATTERN = /\b(?:https?:\/\/|www\.)[^\s<>"'()\[\]]+/gi;
+
+/**
  * Full address line: house number followed by street name, up to a comma
  * or newline. Used mainly for the address_line category flag.
  */
@@ -317,6 +328,24 @@ const DETECTORS = [
           text: m[0],
           category: 'postcode_full',
           extra: { outward },
+        });
+      }
+      return out;
+    },
+  },
+  {
+    name: 'url',
+    run(text) {
+      const out = [];
+      for (const m of text.matchAll(URL_PATTERN)) {
+        let matched = m[0];
+        while (/[.,;:!?)\]]$/.test(matched)) matched = matched.slice(0, -1);
+        if (matched.length < 6) continue;
+        out.push({
+          start: m.index,
+          end: m.index + matched.length,
+          text: matched,
+          category: 'url',
         });
       }
       return out;
@@ -2527,6 +2556,8 @@ function init() {
   document.getElementById('btn-copy-sanitised').addEventListener('click', onCopySanitised);
   document.getElementById('btn-resanitise').addEventListener('click', onSanitise);
   document.getElementById('btn-delete-file').addEventListener('click', onDeleteOpenFile);
+  const btnTokSel = document.getElementById('btn-tokenise-selection');
+  if (btnTokSel) btnTokSel.addEventListener('click', onTokeniseSelection);
   document.getElementById('ner-toggle').addEventListener('change', onNerToggleChange);
   document.querySelectorAll('#file-view .tabs .tab').forEach((btn) => {
     btn.addEventListener('click', () => switchFileTab(btn.dataset.tab));
@@ -2660,6 +2691,7 @@ function renderSidebar() {
       actions.style.padding = '8px 12px';
       actions.style.display = 'flex';
       actions.style.gap = '6px';
+      actions.style.flexWrap = 'wrap';
       if (c.kind === 'open') {
         const btnPaste = document.createElement('button');
         btnPaste.textContent = 'Paste text as new file';
@@ -3529,6 +3561,30 @@ function aboutPlainText() {
  * Longest strings match first so shorter aliases never chew into
  * longer names.
  */
+/**
+ * Substitute mapping entries into a filename so real names do not leak
+ * into the sanitised file's "# Source:" header line. Only entries with
+ * both an original and a token are considered. Case-insensitive.
+ * Longest originals first so short aliases do not partially match.
+ */
+function sanitiseFilenameForHeader(filename, mapping) {
+  if (!filename) return filename;
+  let out = String(filename);
+  const entries = [...((mapping && mapping.entries) || [])]
+    .filter((e) => e && e.original && e.token)
+    .sort((a, b) => (b.original.length + (b.aliases || []).length) - (a.original.length + (a.aliases || []).length));
+  for (const e of entries) {
+    const strings = [e.original, ...((e.aliases || []))];
+    for (const s of strings) {
+      if (!s || s.length < 2) continue;
+      const escaped = s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const rx = new RegExp(escaped, 'gi');
+      out = out.replace(rx, e.token);
+    }
+  }
+  return out;
+}
+
 function renderHighlightedOriginalHtml(text, mapping) {
   const entries = (mapping && mapping.entries) || [];
   const needles = [];
@@ -3631,7 +3687,23 @@ async function onSanitise() {
   // without appearing in the review dialog. The adviser has already
   // approved these; showing them again is noise.
   const knownEntities = entities.filter((e) => e.known && e.known.token);
-  const unknownEntities = entities.filter((e) => !e.known || !e.known.token);
+  const unknownEntitiesAll = entities.filter((e) => !e.known || !e.known.token);
+  // Dedupe unknown entities by (case-insensitive) text: the review dialog
+  // should ask about "Kieran Beatham" once, not once per occurrence in the
+  // document. After the adviser decides, that decision is expanded back
+  // to every occurrence during application.
+  const occurrencesByKey = new Map();
+  const unknownEntities = [];
+  for (const e of unknownEntitiesAll) {
+    const key = (e.text || '').toLowerCase().trim();
+    if (!key) continue;
+    if (occurrencesByKey.has(key)) {
+      occurrencesByKey.get(key).push(e);
+    } else {
+      occurrencesByKey.set(key, [e]);
+      unknownEntities.push(e);
+    }
+  }
   const priorSummary = summarisePriorAppearances(entities);
   const earlySpecialFlags = detectSpecialCategorySignals(state.currentText);
   const result = await openReviewDialog(unknownEntities, mapping, {
@@ -3646,12 +3718,29 @@ async function onSanitise() {
     if (upd.aliasFor) addAlias(mapping, upd.aliasFor, upd.alias);
   }
   const safeAudit = await persistSafeListUpdates(mapping, result.safeListUpdates || []);
+  // Expand the one-per-text decisions the adviser made back onto every
+  // occurrence in the document, using the occurrencesByKey map built above.
+  const expandedReviewedDecisions = [];
+  for (const d of result.decisions) {
+    const key = (d.text || '').toLowerCase().trim();
+    const occurrences = occurrencesByKey.get(key) || [d];
+    for (const occ of occurrences) {
+      expandedReviewedDecisions.push({
+        ...d,
+        start: occ.start,
+        end: occ.end,
+        text: occ.text,
+        contextBefore: occ.contextBefore,
+        contextAfter: occ.contextAfter,
+      });
+    }
+  }
   const autoDecisions = knownEntities.map((e) => ({
     ...e,
     action: 'tokenise',
     token: e.known.token,
   }));
-  const allDecisions = [...autoDecisions, ...result.decisions].sort((a, b) => a.start - b.start);
+  const allDecisions = [...autoDecisions, ...expandedReviewedDecisions].sort((a, b) => a.start - b.start);
   const sanitisedRaw = applySanitisation(state.currentText, allDecisions);
   let sanitised;
   let verbatimIds = [];
@@ -3678,9 +3767,10 @@ async function onSanitise() {
     }
     await appendAudit(c.rawHandle, `Special-category confirmed by adviser: ${summariseSpecialCategoryFlags(specialFlags).join(', ')}`);
   }
+  const sanitisedSourceName = sanitiseFilenameForHeader(state.selectedFile, mapping);
   const header = buildHeader({
     caseId: c.id,
-    sourceName: state.selectedFile,
+    sourceName: sanitisedSourceName,
     tokensUsed: allDecisions.filter((d) => d.action === 'tokenise').map((d) => d.token),
     sanitisedDateISO: new Date().toISOString(),
     verbatimCount: verbatimIds.length,
@@ -4550,6 +4640,113 @@ function updateNerStatus(label) {
   if (!el) return;
   if (!label) { el.textContent = ''; return; }
   el.textContent = `(${label})`;
+}
+
+/**
+ * Manual tokenise-from-selection. The adviser highlights any text in
+ * the Original tab (or the Sanitised tab as an alias) and clicks
+ * "Tokenise selection". A modal prompts for the token; on confirm the
+ * text is added to the case mapping and applied across every occurrence
+ * in the file. The updated file is written back through the same
+ * sanitisation path so integrity checks (checkOutgoing, verbatim,
+ * special category) run.
+ */
+async function onTokeniseSelection() {
+  const selection = String(window.getSelection ? window.getSelection().toString() : '').trim();
+  if (!selection) {
+    showToast('Highlight some text in the Original tab first, then click Tokenise selection.', true);
+    return;
+  }
+  if (!state.selectedCaseId || !state.selectedFile) {
+    showToast('Open a file first.', true);
+    return;
+  }
+  if (!state.currentText || !state.currentText.includes(selection)) {
+    // Case-insensitive fallback: warn but allow if it appears in a different case.
+    const ci = state.currentText && state.currentText.toLowerCase().includes(selection.toLowerCase());
+    if (!ci) {
+      showToast('The highlighted text does not appear in the Original view of this file.', true);
+      return;
+    }
+  }
+  const token = await promptForToken(selection);
+  if (!token) return;
+  const c = state.cases.find((x) => x.id === state.selectedCaseId);
+  if (!c) return;
+  const mapping = state.currentMapping || (await loadMapping(c.rawHandle, c.id));
+  const existing = findByOriginal(mapping, selection);
+  if (existing) {
+    if (!confirm(`"${selection}" is already mapped to ${existing.token}. Add "${selection}" as an alias for ${token}?`)) return;
+    if (!existing.aliases) existing.aliases = [];
+    if (!existing.aliases.some((a) => a.toLowerCase() === selection.toLowerCase())) existing.aliases.push(selection);
+    existing.token = token;
+  } else {
+    addEntry(mapping, {
+      original: selection,
+      token,
+      category: 'manual',
+    });
+  }
+  await saveMapping(c.rawHandle, mapping);
+  state.currentMapping = mapping;
+  // Now trigger a normal sanitisation which will auto-apply the new
+  // entry (it is a known mapping now) and re-write the sanitised copy.
+  await appendAudit(c.rawHandle, `Manual token added: "${selection}" -> ${token}`);
+  await onSanitise();
+}
+
+/**
+ * Modal token prompt with the standard role vocabulary + a custom
+ * text field. Kept small; returns the picked token, or null if the
+ * adviser cancels.
+ */
+function promptForToken(sampleText) {
+  return new Promise((resolve) => {
+    const root = document.getElementById('dialog-root');
+    root.innerHTML = '';
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop';
+    const modal = document.createElement('div');
+    modal.className = 'modal';
+    modal.style.width = '520px';
+    backdrop.appendChild(modal);
+    modal.innerHTML = `
+      <div class="modal-header">Tokenise "${escapeHtml(sampleText.slice(0, 80))}${sampleText.length > 80 ? '...' : ''}"</div>
+      <div class="modal-body">
+        <div class="form-row">
+          <label>Pick a role from the vocabulary</label>
+          <select id="tokenise-role">
+            ${ROLE_GROUPS.map((g) => `<optgroup label="${escapeHtml(g.label)}">${g.roles.map((r) => `<option value="${escapeHtml(r)}">${escapeHtml(r)}</option>`).join('')}</optgroup>`).join('')}
+          </select>
+        </div>
+        <div class="form-row">
+          <label>...or type a custom token like [LENDER] or [PROPERTY MANAGER]</label>
+          <input id="tokenise-custom" type="text" spellcheck="false" autocomplete="off" placeholder="[LENDER]">
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button data-action="cancel">Cancel</button>
+        <button class="primary" data-action="ok">Add to mapping and re-sanitise</button>
+      </div>
+    `;
+    root.appendChild(backdrop);
+    setTimeout(() => modal.querySelector('#tokenise-custom').focus(), 0);
+    modal.addEventListener('click', (ev) => {
+      const a = ev.target.dataset && ev.target.dataset.action;
+      if (a === 'cancel') { backdrop.remove(); resolve(null); return; }
+      if (a === 'ok') {
+        const custom = modal.querySelector('#tokenise-custom').value.trim();
+        const role = modal.querySelector('#tokenise-role').value;
+        const picked = custom || role;
+        if (!/^\[[^\]]+\]$/.test(picked)) {
+          showToast('Token must be in [ROLE] form. For example [CL] or [LENDER].', true);
+          return;
+        }
+        backdrop.remove();
+        resolve(picked);
+      }
+    });
+  });
 }
 
 async function onDeleteOpenFile() {
