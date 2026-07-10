@@ -2291,8 +2291,74 @@ async function handleDroppedFile(caseObj, file, emlSummaries) {
       return savedName;
     }
   }
+  if (lower.endsWith('.msg')) {
+    if (typeof window.MsgReader !== 'function') {
+      const buf = await file.arrayBuffer();
+      const savedName = await writeRawUnique(caseObj.rawHandle, file.name, buf);
+      showToast(`.msg support requires lib/msgreader.min.js in the same folder. Saved raw for now.`, true);
+      return savedName;
+    }
+    try {
+      const buf = await file.arrayBuffer();
+      const parsed = parseMsg(buf);
+      const text = formatEmlAsText(parsed, file.name);
+      const savedName = await writeUnique(caseObj.rawHandle, replaceExtension(file.name, '.txt'), text);
+      emlSummaries.push({
+        sourceName: file.name,
+        savedName,
+        attachments: parsed.attachments,
+        warnings: parsed.warnings,
+      });
+      return savedName;
+    } catch (err) {
+      const buf = await file.arrayBuffer();
+      const savedName = await writeRawUnique(caseObj.rawHandle, file.name, buf);
+      showToast(`Could not parse ${file.name} as .msg (${err.message}); saved raw. Try Outlook > Save As > .eml and drop that instead.`, true);
+      return savedName;
+    }
+  }
   const buf = await file.arrayBuffer();
   return writeRawUnique(caseObj.rawHandle, file.name, buf);
+}
+
+/**
+ * Adapt msgreader's output shape into the same `{ headers, bodyText,
+ * attachments, warnings }` structure the .eml pipeline uses, so both
+ * formats flow through `formatEmlAsText` and land on disk with the same
+ * header layout. Recipients are consolidated into To / Cc lines; the
+ * primary body is text/plain (bodyHtml stripped as a fallback).
+ */
+function parseMsg(arrayBuffer) {
+  const reader = new window.MsgReader(arrayBuffer);
+  const data = reader.getFileData();
+  const warnings = [];
+  const headers = [];
+  const push = (name, value) => { if (value) headers.push({ name, value }); };
+  const senderLine = data.senderName
+    ? (data.senderEmail ? `${data.senderName} <${data.senderEmail}>` : data.senderName)
+    : (data.senderEmail || '');
+  push('From', senderLine);
+  const toList = (data.recipients || []).filter((r) => (r.recipType || 'to') === 'to')
+    .map((r) => r.name ? `${r.name} <${r.email || ''}>` : (r.email || '')).filter(Boolean).join(', ');
+  const ccList = (data.recipients || []).filter((r) => r.recipType === 'cc')
+    .map((r) => r.name ? `${r.name} <${r.email || ''}>` : (r.email || '')).filter(Boolean).join(', ');
+  push('To', toList);
+  push('Cc', ccList);
+  push('Subject', data.subject || data.normalizedSubject || '');
+  push('Date', data.messageDeliveryTime || data.clientSubmitTime || '');
+  push('Message-ID', data.internetMessageId || '');
+  push('In-Reply-To', data.inReplyToId || '');
+  let bodyText = data.body || '';
+  if (!bodyText && data.bodyHtml) {
+    warnings.push('No plain-text body; extracted from HTML fallback.');
+    bodyText = emlHtmlToText(data.bodyHtml);
+  }
+  const attachments = (data.attachments || []).map((a) => ({
+    filename: a.fileName || a.displayName || '(unnamed)',
+    contentType: a.mimeType || 'application/octet-stream',
+    approxSize: a.contentLength || 0,
+  }));
+  return { headers, bodyText, attachments, warnings };
 }
 
 async function readFileAsUtf8(file) {
@@ -2434,7 +2500,7 @@ function classifyUnsupported(name) {
   const lower = name.toLowerCase();
   const map = [
     ['.pdf', 'PDFs are not yet extracted by the tool. PDF.js integration is phase 2.'],
-    ['.msg', 'Outlook .msg files are binary. Native parsing is phase 2 (msgreader).'],
+    ['.msg', 'Outlook .msg files are parsed on drop. This file is a raw copy left over from before .msg support arrived; delete and re-drop the source to import it as text.'],
     ['.doc', 'Legacy .doc format is not supported. Copy the text out and paste it back in.'],
     ['.docx', '.docx files are not yet parsed. Copy the text out and paste it back in.'],
     ['.xls', 'Excel files are not supported.'],

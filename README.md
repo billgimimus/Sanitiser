@@ -56,7 +56,7 @@ The saved text contains a readable header block (From, To, Cc, Subject, Date, Me
 
 A summary modal opens after import listing attachments and any parser warnings. If parsing fails, the raw `.eml` is saved unchanged and the paste-text failsafe stays available.
 
-Outlook `.msg` files are still binary and need vendored `msgreader` support, which will follow in a second commit. For those, use the paste-text failsafe: right-click the email in Outlook, choose "Save as", pick `.txt`, drop it in.
+Outlook `.msg` files are parsed too, via a vendored `msgreader` bundle at `lib/msgreader.min.js`. Copy `lib/msgreader.min.js` and `lib/msgreader.LICENSE` across along with `js/app.js` and `index.html`. Drag `.msg` files onto a case the same way as `.eml`; the tool extracts sender, recipients, subject, date, body, and attachment metadata into a plain-text file, using the same header layout as `.eml`.
 
 ## Formats the tool cannot yet parse
 

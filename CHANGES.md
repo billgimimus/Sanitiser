@@ -45,6 +45,19 @@ Built:
 - Binary heuristic fallback for files with unfamiliar extensions: if the first kilobyte contains more than 5% control characters (excluding tab, CR, LF), the file is treated as unsupported.
 - Audit log now records paste-text events with the optional source note.
 
+## Phase 2.4: Outlook .msg drag-drop
+
+Add vendored `lib/msgreader.min.js` (Apache 2.0, `@kenjiuno/msgreader` bundled to browser IIFE with esbuild, 611 KB). Drop handler routes `.msg` files through the library, adapts the output shape into the same `{ headers, bodyText, attachments, warnings }` structure the .eml pipeline uses, and lands on disk with the same header layout. Recipients are consolidated into To / Cc lines; the plain-text body is preferred, with HTML → text as a fallback.
+
+If `lib/msgreader.min.js` is missing or the library fails to load, the drop falls back to a raw byte copy with a clear toast pointing at Outlook's Save As `.eml` as the workaround.
+
+Files to copy across when updating a laptop that already has phase 2.1:
+
+- `js/app.js`
+- `index.html`
+- `lib/msgreader.min.js` (new)
+- `lib/msgreader.LICENSE` (new)
+
 ## Phase 2.3: passive cross-case conflict banner
 
 Introduce a cross-case watchlist at the casework root (`_watchlist.json`). Every real identifier tokenised in any case, open or closed, is appended to the watchlist after a successful sanitisation. On the next sanitisation of a different case, detected entities are cross-checked against the watchlist.
