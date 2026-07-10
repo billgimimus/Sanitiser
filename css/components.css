@@ -1,216 +1,464 @@
-/* Buttons, dialogs, tabs, toasts. Kept together so styling stays consistent. */
+/* Casework Sanitiser · CRM polish v1
+   Component styling — buttons, tabs, modals, tables, chips, toasts.
+   Class names are preserved from the original tool so js/app.js keeps
+   working; this file just re-skins.
+*/
+
+/* ============================================================== */
+/* BUTTONS                                                         */
+/* ============================================================== */
 
 button {
   font: inherit;
   padding: 6px 12px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-strong);
   background: var(--panel);
-  border-radius: 4px;
+  border-radius: 3px;
   cursor: pointer;
-  color: inherit;
+  color: var(--text);
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: background 80ms ease, border-color 80ms ease;
 }
-
 button:hover:not(:disabled) {
-  background: #eee;
+  background: var(--panel-alt);
+  border-color: #b8bcc2;
 }
-
+button:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+  border-color: var(--accent);
+}
 button:disabled {
-  opacity: 0.5;
+  opacity: 0.55;
   cursor: not-allowed;
 }
 
-button.primary {
+.btn { /* alias for explicit classing when needed */ }
+.btn-sm { height: 26px; padding: 0 10px; font-size: 12px; }
+
+button.primary, .btn-primary {
   background: var(--accent);
   color: var(--accent-text);
   border-color: var(--accent);
-}
-
-button.primary:hover:not(:disabled) {
-  background: #23506f;
-}
-
-button.danger {
-  background: var(--error-bg);
-  border-color: var(--error-border);
-  color: var(--error-text);
-}
-
-.tab {
-  padding: 6px 14px;
-  border: 1px solid transparent;
-  border-bottom: none;
-  background: transparent;
-  cursor: pointer;
-  border-radius: 4px 4px 0 0;
-  color: var(--muted);
-}
-
-.tab.active {
-  background: var(--panel);
-  border-color: var(--border);
-  color: var(--text);
   font-weight: 600;
 }
+button.primary:hover:not(:disabled), .btn-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
 
-/* Modal */
+.btn-primary-outline {
+  background: var(--panel);
+  color: var(--accent);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+.btn-primary-outline:hover:not(:disabled) {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+button.danger, .btn.danger {
+  background: var(--panel);
+  color: var(--error-strong);
+  border-color: #d69090;
+}
+button.danger:hover:not(:disabled), .btn.danger:hover:not(:disabled) {
+  background: var(--error-bg);
+  border-color: var(--error-border);
+}
+
+/* ============================================================== */
+/* TABS                                                            */
+/* ============================================================== */
+
+.tab {
+  padding: 8px 16px;
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  cursor: pointer;
+  border-radius: 0;
+  color: var(--muted);
+  font-size: 13px;
+  height: auto;
+  transition: color 80ms ease, border-color 80ms ease;
+}
+.tab:hover:not(.active) {
+  color: var(--text-2);
+  background: transparent;
+  border-color: transparent;
+}
+.tab.active {
+  color: var(--topbar);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+.tab:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px rgba(15, 90, 168, 0.25);
+}
+
+/* Sidebar tabs are narrower */
+.sidebar-tabs .tab {
+  padding: 6px 12px 8px;
+  font-size: 12px;
+}
+
+/* ============================================================== */
+/* MODAL                                                           */
+/* ============================================================== */
 
 .modal-backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(20, 20, 20, 0.35);
+  background: rgba(15, 30, 46, 0.42);
   display: flex;
   align-items: center;
   justify-content: center;
   z-index: 100;
+  padding: 32px;
+  animation: modal-fade-in 120ms ease-out;
 }
+@keyframes modal-fade-in { from { opacity: 0; } to { opacity: 1; } }
 
 .modal {
   background: var(--panel);
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-strong);
   border-radius: 6px;
   min-width: 480px;
   max-width: 90vw;
   max-height: 90vh;
   display: flex;
   flex-direction: column;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);
+  box-shadow: var(--shadow-modal);
+  animation: modal-rise 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+@keyframes modal-rise {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 .modal-header {
-  padding: 12px 16px;
+  padding: 14px 20px;
   border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   font-weight: 600;
+  color: var(--topbar);
+  font-size: 15px;
 }
 
 .modal-body {
-  padding: 12px 16px;
+  padding: 14px 20px;
   overflow-y: auto;
   flex: 1;
+  font-size: 13px;
+  color: var(--text-2);
+  line-height: 1.55;
 }
 
 .modal-footer {
-  padding: 12px 16px;
+  padding: 12px 20px;
   border-top: 1px solid var(--border);
+  background: var(--panel-alt);
   display: flex;
   justify-content: flex-end;
   gap: 8px;
 }
 
+/* Form rows inside modals */
+
 .form-row {
-  margin-bottom: 10px;
+  margin-bottom: 12px;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 5px;
 }
-
 .form-row label {
-  font-weight: 500;
+  font-weight: 600;
   font-size: 12px;
+  color: var(--text-2);
 }
-
 .form-row input,
 .form-row select,
 .form-row textarea {
-  padding: 6px 8px;
+  padding: 7px 10px;
   font: inherit;
-  border: 1px solid var(--border);
-  border-radius: 4px;
+  font-size: 13px;
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
   background: var(--panel);
-  color: inherit;
+  color: var(--text);
+  transition: border-color 80ms ease, box-shadow 80ms ease;
 }
+.form-row textarea { min-height: 80px; resize: vertical; }
+.form-row input:focus,
+.form-row select:focus,
+.form-row textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: var(--focus-ring);
+}
+
+/* ============================================================== */
+/* ENTITY TABLE (sanitisation review dialog)                       */
+/* ============================================================== */
 
 .entity-table {
   border-collapse: collapse;
   width: 100%;
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .entity-table th,
 .entity-table td {
-  padding: 6px 8px;
-  border-bottom: 1px solid var(--border);
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border-subtle);
   text-align: left;
   vertical-align: top;
 }
 
 .entity-table th {
-  background: #f0eee9;
+  background: var(--panel-alt);
   font-weight: 600;
   position: sticky;
   top: 0;
+  color: var(--text-2);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  border-bottom: 1px solid var(--border-strong);
+  z-index: 1;
 }
+
+.entity-table tbody tr:hover { background: color-mix(in oklab, var(--accent-soft) 30%, white); }
+.entity-table tbody tr.flagged { background: #fff9e6; }
+.entity-table tbody tr.flagged:hover { background: #fff3cc; }
 
 .entity-table select,
 .entity-table input {
   width: 100%;
-  padding: 4px 6px;
+  padding: 5px 8px;
   font: inherit;
-  border: 1px solid var(--border);
-  border-radius: 4px;
+  font-size: 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  background: var(--panel);
+  color: var(--text);
+}
+.entity-table select:focus,
+.entity-table input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: var(--focus-ring);
 }
 
 .entity-original {
   font-family: var(--mono);
   font-size: 12px;
   word-break: break-all;
+  color: var(--text);
+}
+.entity-original mark {
+  background: var(--warning-bg);
+  padding: 0 2px;
+  border-radius: 2px;
 }
 
 .entity-category {
-  font-size: 11px;
+  font-size: 10px;
   color: var(--muted);
   text-transform: uppercase;
-  letter-spacing: 0.5px;
+  letter-spacing: 0.06em;
+  font-weight: 600;
 }
 
+/* ============================================================== */
+/* CHIPS                                                           */
+/* ============================================================== */
+
 .chip {
-  display: inline-block;
-  font-size: 11px;
-  padding: 2px 6px;
-  border-radius: 8px;
-  background: #e6e6e6;
+  display: inline-flex;
+  align-items: center;
+  font-size: 10px;
+  padding: 2px 7px;
+  border-radius: 10px;
+  background: var(--panel-sunken);
   color: var(--muted);
   margin-right: 4px;
+  font-weight: 500;
+  line-height: 1.5;
+  white-space: nowrap;
 }
 
 .chip.flag {
-  background: var(--warning-bg);
+  background: var(--warning-bg-strong);
   color: var(--warning-text);
   border: 1px solid var(--warning-border);
 }
 
-.toast {
+.chip.regex { background: var(--accent-soft); color: var(--accent-hover); }
+.chip.ner { background: var(--ner-bg); color: var(--ner-text); border: 1px solid var(--ner-border); }
+.chip.safe { background: var(--success-bg); color: var(--success-text); font-weight: 600; }
+
+/* ============================================================== */
+/* TOASTS                                                          */
+/* ============================================================== */
+
+#toast-root {
   position: fixed;
   bottom: 24px;
   right: 24px;
-  background: var(--text);
-  color: #fff;
-  padding: 10px 16px;
-  border-radius: 4px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
   z-index: 200;
+  pointer-events: none;
+}
+#toast-root > * { pointer-events: auto; }
+
+.toast {
+  background: var(--topbar);
+  color: #ffffff;
+  padding: 12px 16px;
+  border-radius: 4px;
+  box-shadow: var(--shadow-toast);
   max-width: 400px;
   font-size: 13px;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  animation: toast-in 200ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+@keyframes toast-in {
+  from { opacity: 0; transform: translateX(20px); }
+  to { opacity: 1; transform: translateX(0); }
 }
 
 .toast.error {
   background: var(--error-text);
+  color: #ffffff;
 }
+.toast.success {
+  background: var(--topbar);
+  color: #ffffff;
+}
+.toast.success::before {
+  content: "✓";
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--success-strong);
+  color: #ffffff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  flex-shrink: 0;
+  font-size: 12px;
+}
+
+/* ============================================================== */
+/* INTEGRITY BLOCK (verbatim mismatch)                             */
+/* ============================================================== */
 
 .integrity-block {
   background: var(--warning-bg);
   border: 1px solid var(--warning-border);
-  padding: 8px 12px;
+  border-left: 3px solid var(--warning-border-strong);
+  padding: 12px 14px;
   margin-bottom: 12px;
-  border-radius: 4px;
-  color: var(--warning-text);
+  border-radius: 3px;
+  color: var(--warning-text-strong);
+  font-size: 12px;
+  line-height: 1.55;
 }
 
+.integrity-block strong { color: var(--warning-text); font-weight: 600; }
+
 .integrity-block ul {
-  margin: 4px 0 8px 20px;
+  margin: 6px 0 0 20px;
   padding: 0;
 }
 
 .integrity-block li {
   font-family: var(--mono);
   font-size: 12px;
+  margin-bottom: 2px;
+}
+
+/* ============================================================== */
+/* CONFLICT BANNER (cross-case)                                    */
+/* ============================================================== */
+
+.conflict-banner {
+  background: var(--warning-bg-strong);
+  border: 1px solid var(--warning-border);
+  border-left: 3px solid var(--warning-border-strong);
+  padding: 10px 12px;
+  border-radius: 3px;
+  color: var(--warning-text-strong);
+  font-size: 12px;
+  margin-bottom: 12px;
+  line-height: 1.5;
+}
+.conflict-banner strong { font-weight: 600; }
+.conflict-banner a { color: var(--accent); text-decoration: underline; }
+
+/* ============================================================== */
+/* INLINE HIGHLIGHTS (Original tab, if the app adds them)          */
+/* ============================================================== */
+
+pre .span-tok,
+.span-tok {
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+  border-bottom: 2px solid var(--accent);
+  padding: 0 2px;
+  cursor: pointer;
+  border-radius: 2px 2px 0 0;
+}
+pre .span-pending,
+.span-pending {
+  background: var(--warning-bg);
+  color: var(--warning-text);
+  border-bottom: 2px solid var(--warning-border-strong);
+  padding: 0 2px;
+  cursor: pointer;
+  border-radius: 2px 2px 0 0;
+}
+pre .span-ner,
+.span-ner {
+  background: var(--ner-bg);
+  color: var(--ner-text);
+  border-bottom: 2px solid #7a3aa0;
+  padding: 0 2px;
+  cursor: pointer;
+  border-radius: 2px 2px 0 0;
+}
+pre .span-safe,
+.span-safe {
+  background: color-mix(in oklab, var(--success-bg) 60%, white);
+  color: var(--success-text);
+  border-bottom: 2px solid var(--success-text);
+  padding: 0 2px;
+  border-radius: 2px 2px 0 0;
+}
+
+/* Verbatim block rendering */
+pre .verbatim,
+.verbatim {
+  display: block;
+  background: var(--accent-soft);
+  border-left: 3px solid var(--accent);
+  padding: 8px 12px;
+  margin: 8px 0;
+  border-radius: 0 3px 3px 0;
+  font-family: var(--mono);
 }

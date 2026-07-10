@@ -3,36 +3,77 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Casework Sanitisation Tool</title>
+  <title>Casework Sanitisation Tool · Shelter</title>
   <link rel="stylesheet" href="css/main.css">
   <link rel="stylesheet" href="css/components.css">
 </head>
 <body>
   <div id="app">
     <header id="topbar">
-      <div class="brand">Casework Sanitisation Tool</div>
+      <div class="brand">
+        <svg class="brand-mark" width="22" height="22" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M4 20 L12 4 L20 20 L16.2 20 L12 11.6 L7.8 20 Z" fill="#e11d2e"/>
+        </svg>
+        <span class="brand-org">Shelter</span>
+        <span class="brand-sep">·</span>
+        <span class="brand-title">Casework Sanitiser</span>
+      </div>
+
+      <div class="topbar-context">
+        <span class="topbar-context-label">Casework root:</span>
+        <span id="root-path" class="topbar-context-path"></span>
+        <button id="btn-open-root" class="topbar-context-change" type="button">Change folder</button>
+      </div>
+
       <div class="topbar-actions">
-        <button id="btn-open-root" class="primary" type="button">Open casework folder</button>
-        <span id="root-path" class="muted"></span>
-        <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;" title="Uses a local machine-learning model to improve detection of names the regex layer misses (especially non-Western names). First activation downloads about 50 MB from huggingface.co.">
+        <label class="ner-toggle" title="Uses a local machine-learning model to improve detection of names the regex layer misses (especially non-Western names). First activation downloads about 50 MB from huggingface.co.">
           <input id="ner-toggle" type="checkbox">
-          <span class="muted">Enhanced detection (NER)</span>
+          <span class="ner-toggle-switch" aria-hidden="true"></span>
+          <span class="ner-toggle-label">Enhanced detection</span>
+          <span id="ner-status" class="ner-toggle-status"></span>
         </label>
-        <span id="ner-status" class="muted"></span>
-        <span id="clipboard-indicator" class="muted" aria-live="polite"></span>
+        <span id="clipboard-indicator" class="clipboard-indicator" aria-live="polite"></span>
+        <div class="topbar-user" aria-hidden="true">WC</div>
       </div>
     </header>
 
     <main id="main">
+      <nav class="icon-rail" aria-label="Sections">
+        <button class="icon-rail-item is-active" type="button" title="Cases">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 7 L10 7 L12 5 L21 5 L21 19 L3 19 Z"/></svg>
+        </button>
+        <button class="icon-rail-item" type="button" title="Recent activity">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 6 L20 6 M4 12 L20 12 M4 18 L14 18"/></svg>
+        </button>
+        <button class="icon-rail-item" type="button" title="Watchlist &amp; conflicts">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M5 4 L5 21 M5 4 L18 4 L15 9 L18 14 L5 14"/></svg>
+        </button>
+        <button class="icon-rail-item" type="button" title="Audit log">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="8"/><path d="M12 8 L12 12 L15 14"/></svg>
+        </button>
+        <div class="icon-rail-spacer"></div>
+        <button class="icon-rail-item" type="button" title="Help">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="8"/><path d="M9 10 A3 3 0 0 1 15 10 C15 12 12 12 12 14 M12 17 L12 17.5"/></svg>
+        </button>
+        <button class="icon-rail-item" type="button" title="Settings">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="3"/><path d="M12 3 L12 6 M12 18 L12 21 M3 12 L6 12 M18 12 L21 12 M5.6 5.6 L7.7 7.7 M16.3 16.3 L18.4 18.4 M5.6 18.4 L7.7 16.3 M16.3 7.7 L18.4 5.6"/></svg>
+        </button>
+      </nav>
+
       <aside id="sidebar">
         <div class="sidebar-section">
+          <div class="sidebar-header">
+            <div class="sidebar-title">Cases</div>
+            <div class="sidebar-actions">
+              <button id="btn-new-case" class="btn btn-sm btn-primary-outline" type="button">
+                <span aria-hidden="true">+</span> New case
+              </button>
+              <button id="btn-paste-rehydrate" class="btn btn-sm" type="button" title="Paste text from an AI response and rehydrate tokens back to real identifiers">Paste rehydrate</button>
+            </div>
+          </div>
           <div class="sidebar-tabs" role="tablist">
             <button class="tab active" data-view="open" type="button" role="tab">Open cases</button>
             <button class="tab" data-view="closed" type="button" role="tab">Closed cases</button>
-          </div>
-          <div class="sidebar-actions">
-            <button id="btn-new-case" type="button">New case</button>
-            <button id="btn-paste-rehydrate" type="button" title="Paste text from an AI response and rehydrate tokens back to real identifiers">Paste rehydrate</button>
           </div>
         </div>
         <div id="case-list" class="case-list"></div>
@@ -40,33 +81,45 @@
 
       <section id="workarea">
         <div id="welcome" class="welcome">
-          <h1>Getting started</h1>
+          <div class="welcome-eyebrow">Getting started</div>
+          <h1>Pseudonymise casework before it leaves this machine.</h1>
+          <p class="welcome-lead">This tool sits between the case file and the AI service. It runs entirely in the browser tab — no case data is transmitted anywhere.</p>
           <ol>
-            <li>Click <strong>Open casework folder</strong> and grant access to a folder that will hold your <code>Casework</code>, <code>Casework_sanitised</code>, <code>Casework_closed</code>, and <code>Casework_sanitised_closed</code> subfolders. The tool will create any that are missing.</li>
+            <li>Click <strong>Open casework folder</strong> and grant access to a folder that will hold your <code>Casework</code>, <code>Casework_sanitised</code>, <code>Casework_closed</code>, and <code>Casework_sanitised_closed</code> subfolders. Missing ones are created.</li>
             <li>Add a case with <strong>New case</strong>, or open an existing case from the sidebar.</li>
             <li>Open a document to sanitise it. Use <strong>Copy sanitised</strong> to send tokenised text to an AI service. Use <strong>Paste rehydrate</strong> to convert the reply back to real identifiers.</li>
           </ol>
-          <p class="muted">This tool runs entirely in your browser. No case data is sent anywhere.</p>
+          <div class="welcome-note">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 8 L12 12 M12 15 L12 15.5"/></svg>
+            <span>Requires Chrome, Edge or Opera (File System Access API). No server, no build step, no dependencies to install.</span>
+          </div>
           <p id="browser-warning" class="warning" hidden>This browser does not expose the File System Access API. Please use Chrome, Edge, or Opera.</p>
         </div>
+
         <div id="file-view" hidden>
           <div class="file-header">
-            <div>
+            <div class="file-header-meta">
               <div id="file-name" class="file-name"></div>
-              <div id="file-case" class="muted"></div>
+              <div id="file-case" class="file-case muted"></div>
             </div>
             <div class="file-actions">
-              <button id="btn-sanitise" type="button">Sanitise this file</button>
-              <button id="btn-copy-sanitised" type="button" disabled>Copy sanitised</button>
-              <button id="btn-resanitise" type="button" hidden>Re-sanitise</button>
-              <button id="btn-delete-file" type="button" class="danger" title="Delete this file from the case. Removes the raw copy and the sanitised copy if one exists.">Delete file</button>
+              <button id="btn-sanitise" class="btn btn-primary" type="button">Sanitise this file</button>
+              <button id="btn-copy-sanitised" class="btn" type="button" disabled>Copy sanitised</button>
+              <button id="btn-resanitise" class="btn" type="button" hidden>Re-sanitise</button>
+              <button id="btn-delete-file" class="btn danger" type="button" title="Delete this file from the case. Removes the raw copy and the sanitised copy if one exists.">Delete file</button>
             </div>
           </div>
+
           <div class="tabs" role="tablist">
             <button class="tab active" data-tab="original" type="button" role="tab">Original</button>
             <button class="tab" data-tab="sanitised" type="button" role="tab">Sanitised</button>
           </div>
-          <div id="stale-warning" class="warning" hidden>The original has changed since it was last sanitised. Re-sanitise before use.</div>
+
+          <div id="stale-warning" class="warning" hidden>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 3 L22 20 L2 20 Z M12 10 L12 15 M12 18 L12 18.5"/></svg>
+            <span>The original has changed since it was last sanitised. Re-sanitise before use.</span>
+          </div>
+
           <div id="tab-original" class="tab-panel" role="tabpanel">
             <pre id="original-content"></pre>
           </div>
@@ -77,6 +130,14 @@
         </div>
       </section>
     </main>
+
+    <footer class="status-bar" aria-hidden="true">
+      <span class="status-item status-ok">● Ready</span>
+      <span class="status-sep">|</span>
+      <span class="status-item">All processing stays on this machine</span>
+      <div class="status-spacer"></div>
+      <span class="status-item">v1 · Casework Sanitiser for Shelter</span>
+    </footer>
 
     <div id="dialog-root"></div>
     <div id="toast-root" aria-live="polite"></div>
