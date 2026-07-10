@@ -2978,7 +2978,9 @@ async function handleDroppedFile(caseObj, file, emlSummaries) {
     }
     try {
       const buf = await file.arrayBuffer();
-      const parsed = await parsePdf(buf, file.name);
+      const parsed = await parsePdf(buf, file.name, (label) => {
+        showToast(`OCR: ${label}`);
+      });
       const savedName = await writeUnique(caseObj.rawHandle, replaceExtension(file.name, '.txt'), parsed.text);
       emlSummaries.push({
         sourceName: file.name,
@@ -3053,10 +3055,26 @@ let pdfWorkerConfigured = false;
  * consumers expect.
  */
 async function parseImageOcr(arrayBuffer, sourceName, updateProgress) {
+  const blob = new Blob([arrayBuffer]);
+  const { text: rawText, confidence } = await ocrBlob(blob, updateProgress);
+  const warnings = [];
+  if (!rawText.trim()) warnings.push('OCR returned no text. The image may be blank, blurry, or non-textual.');
+  if (confidence != null && confidence < 60) warnings.push(`Overall OCR confidence is low (${confidence.toFixed(1)}%). Cross-check the extracted text against the source image before sanitising.`);
+  const headerLines = [`# OCR extracted from image: ${sourceName}`];
+  if (confidence != null) headerLines.push(`# OCR confidence: ${confidence.toFixed(1)}%`);
+  headerLines.push('# Review the extracted text against the source image before sanitising.', '');
+  return { text: headerLines.join('\n') + rawText, warnings, confidence };
+}
+
+/**
+ * Run Tesseract over any Blob (image file or a canvas.toBlob output for
+ * a rasterised PDF page). Central call so the two OCR entry points share
+ * a single loader, error message and progress protocol.
+ */
+async function ocrBlob(blob, updateProgress) {
   if (typeof window.Tesseract !== 'function' && typeof window.Tesseract !== 'object') {
     throw new Error('Tesseract.js not loaded (check lib/tesseract.min.js).');
   }
-  const blob = new Blob([arrayBuffer]);
   const url = URL.createObjectURL(blob);
   try {
     const result = await window.Tesseract.recognize(url, 'eng', {
@@ -3070,22 +3088,14 @@ async function parseImageOcr(arrayBuffer, sourceName, updateProgress) {
     const confidence = result && result.data && typeof result.data.confidence === 'number'
       ? result.data.confidence
       : null;
-    const rawText = result && result.data && result.data.text ? result.data.text : '';
-    const warnings = [];
-    if (!rawText.trim()) warnings.push('OCR returned no text. The image may be blank, blurry, or non-textual.');
-    if (confidence != null && confidence < 60) warnings.push(`Overall OCR confidence is low (${confidence.toFixed(1)}%). Cross-check the extracted text against the source image before sanitising.`);
-    const headerLines = [
-      `# OCR extracted from image: ${sourceName}`,
-    ];
-    if (confidence != null) headerLines.push(`# OCR confidence: ${confidence.toFixed(1)}%`);
-    headerLines.push('# Review the extracted text against the source image before sanitising.', '');
-    return { text: headerLines.join('\n') + rawText, warnings, confidence };
+    const text = result && result.data && result.data.text ? result.data.text : '';
+    return { text, confidence };
   } finally {
     URL.revokeObjectURL(url);
   }
 }
 
-async function parsePdf(arrayBuffer, sourceName) {
+async function parsePdf(arrayBuffer, sourceName, updateProgress) {
   const pdfjs = window.pdfjsLib;
   if (!pdfWorkerConfigured) {
     try { pdfjs.GlobalWorkerOptions.workerSrc = 'lib/pdf.worker.min.js'; } catch (_e) { /* main-thread fallback */ }
@@ -3099,17 +3109,68 @@ async function parsePdf(arrayBuffer, sourceName) {
   const doc = await loadingTask.promise;
   const warnings = [];
   const parts = [`# Imported from PDF: ${sourceName}`, `# Pages: ${doc.numPages}`, ''];
+  const ocrConfidences = [];
+  let ocrPageCount = 0;
+  const canOcr = typeof window.Tesseract === 'function' || typeof window.Tesseract === 'object';
   for (let i = 1; i <= doc.numPages; i++) {
     const page = await doc.getPage(i);
     const text = await page.getTextContent();
-    const pageText = joinPdfLines(text.items);
-    parts.push(`--- Page ${i} ---`, pageText, '');
-    if (!pageText.trim()) warnings.push(`Page ${i} produced no text (image or scanned page).`);
+    let pageText = joinPdfLines(text.items);
+    let pageMarker = `--- Page ${i} ---`;
+    if (!pageText.trim()) {
+      if (canOcr) {
+        try {
+          if (updateProgress) updateProgress(`page ${i}/${doc.numPages} — rasterising`);
+          const rendered = await renderPdfPageToBlob(page);
+          if (updateProgress) updateProgress(`page ${i}/${doc.numPages} — running OCR`);
+          const { text: ocrText, confidence } = await ocrBlob(rendered, (label) => {
+            if (updateProgress) updateProgress(`page ${i}/${doc.numPages} — ${label}`);
+          });
+          pageText = ocrText || '';
+          ocrPageCount++;
+          if (typeof confidence === 'number') ocrConfidences.push(confidence);
+          const confNote = typeof confidence === 'number' ? ` (OCR ${confidence.toFixed(1)}% confidence)` : '';
+          pageMarker = `--- Page ${i} (OCR${confNote}) ---`;
+          if (!pageText.trim()) warnings.push(`Page ${i} OCR returned no text.`);
+          else if (typeof confidence === 'number' && confidence < 60) warnings.push(`Page ${i} OCR confidence is low (${confidence.toFixed(1)}%).`);
+        } catch (err) {
+          warnings.push(`Page ${i} OCR failed: ${err.message}. Text layer was empty.`);
+        }
+      } else {
+        warnings.push(`Page ${i} produced no text (image or scanned page). Tesseract is not loaded so OCR fallback was skipped.`);
+      }
+    }
+    parts.push(pageMarker, pageText, '');
   }
-  if (doc.numPages && warnings.length === doc.numPages) {
-    warnings.push('No text extracted from any page. The PDF is likely scanned. OCR is not yet in scope.');
+  if (ocrPageCount) {
+    const avg = ocrConfidences.length
+      ? ocrConfidences.reduce((a, b) => a + b, 0) / ocrConfidences.length
+      : null;
+    const avgNote = avg != null ? ` (average confidence ${avg.toFixed(1)}%)` : '';
+    parts.splice(2, 0, `# OCR fallback used on ${ocrPageCount} page${ocrPageCount === 1 ? '' : 's'}${avgNote}. Review the OCR text before sanitising.`);
   }
   return { text: parts.join('\n'), warnings };
+}
+
+/**
+ * Rasterise a PDF.js page to a PNG blob at 2x scale so Tesseract has
+ * enough resolution to read small print. 2x is a compromise between
+ * accuracy and memory - most scanned casework letters are A4 at
+ * ~100dpi, so 2x lands around 200dpi which is Tesseract's sweet spot.
+ */
+async function renderPdfPageToBlob(page) {
+  const viewport = page.getViewport({ scale: 2.0 });
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.ceil(viewport.width);
+  canvas.height = Math.ceil(viewport.height);
+  const ctx = canvas.getContext('2d');
+  await page.render({ canvasContext: ctx, viewport }).promise;
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) resolve(blob);
+      else reject(new Error('Could not rasterise PDF page to image.'));
+    }, 'image/png');
+  });
 }
 
 /**
