@@ -1854,12 +1854,18 @@ function openReviewDialog(entities, mapping, options = {}) {
       if (!rowEl) return;
       const idx = Number(rowEl.dataset.idx);
       if (ev.target.matches('input[data-role="custom"]')) {
-        decisions[idx].token = ev.target.value;
+        const custom = ev.target.value.trim();
+        if (custom) {
+          decisions[idx].token = custom;
+        } else {
+          const sel = rowEl.querySelector('select[data-role="token"]');
+          decisions[idx].token = sel ? sel.value : '';
+        }
         updateSummary(modal, decisions);
       } else if (ev.target.matches('input[data-role="span-text"]')) {
         const ok = repositionSpan(decisions[idx], ev.target.value, documentText);
         updateContextDisplay(rowEl, decisions[idx]);
-        markInvalidText(rowEl, !ok);
+        markInvalidText(rowEl, !ok && decisions[idx].action !== 'preserve');
         updateSummary(modal, decisions);
       }
     });
@@ -1888,16 +1894,31 @@ function openReviewDialog(entities, mapping, options = {}) {
         cleanup();
         resolve(null);
       } else if (action === 'save') {
-        const unresolved = decisions.filter(isUnresolved);
-        const invalid = decisions.filter((d) => d.action !== 'preserve' && d.textInvalid);
-        if (unresolved.length || invalid.length) {
+        const unresolvedIdxs = [];
+        const invalidIdxs = [];
+        decisions.forEach((d, i) => {
+          if (isUnresolved(d)) unresolvedIdxs.push(i);
+          else if ((d.action === 'tokenise' || d.action === 'partial') && d.textInvalid) invalidIdxs.push(i);
+        });
+        if (unresolvedIdxs.length || invalidIdxs.length) {
           highlightUnresolved(tbody, decisions);
           const summary = modal.querySelector('#review-summary');
+          const firstBlocker = (unresolvedIdxs[0] != null ? unresolvedIdxs[0] : invalidIdxs[0]);
+          const firstRow = tbody.children[firstBlocker];
+          const firstText = decisions[firstBlocker] && decisions[firstBlocker].text;
           const parts = [];
-          if (unresolved.length) parts.push(`${unresolved.length} still need a decision`);
-          if (invalid.length) parts.push(`${invalid.length} have edited text that no longer matches the document`);
-          summary.textContent = parts.join(' and ') + '.';
+          if (unresolvedIdxs.length) parts.push(`${unresolvedIdxs.length} still need a decision`);
+          if (invalidIdxs.length) parts.push(`${invalidIdxs.length} have edited text that no longer matches the document`);
+          const rowLabel = firstText ? ` The first is "${firstText}" (row ${firstBlocker + 1} of ${decisions.length}).` : '';
+          summary.textContent = parts.join(' and ') + '.' + rowLabel;
           summary.classList.add('warning');
+          if (firstRow) {
+            firstRow.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            firstRow.style.transition = 'outline-color 200ms ease';
+            firstRow.style.outline = '2px solid var(--warning-border)';
+            firstRow.style.outlineOffset = '-2px';
+            setTimeout(() => { firstRow.style.outline = ''; firstRow.style.outlineOffset = ''; }, 1600);
+          }
           return;
         }
         const { finalDecisions, mappingUpdates } = finaliseDecisions(decisions, mapping);
@@ -1924,22 +1945,50 @@ function repositionSpan(decision, newText, documentText) {
     decision.textInvalid = !!trimmed;
     return false;
   }
-  const win = 100;
   const origStart = decision.originalStart != null ? decision.originalStart : decision.start;
   const origEnd = decision.originalEnd != null ? decision.originalEnd : decision.end;
-  const winStart = Math.max(0, origStart - win);
-  const winEnd = Math.min(documentText.length, origEnd + win);
-  const slice = documentText.slice(winStart, winEnd);
-  let idx = slice.indexOf(trimmed);
-  if (idx === -1) idx = slice.toLowerCase().indexOf(trimmed.toLowerCase());
-  if (idx === -1) { decision.textInvalid = true; return false; }
-  decision.start = winStart + idx;
-  decision.end = winStart + idx + trimmed.length;
+  const found = findClosestOccurrence(documentText, trimmed, origStart, origEnd);
+  if (found == null) { decision.textInvalid = true; return false; }
+  decision.start = found;
+  decision.end = found + trimmed.length;
   decision.text = documentText.slice(decision.start, decision.end);
   decision.contextBefore = documentText.slice(Math.max(0, decision.start - 30), decision.start);
   decision.contextAfter = documentText.slice(decision.end, Math.min(documentText.length, decision.end + 30));
   decision.textInvalid = false;
   return true;
+}
+
+/**
+ * Find the occurrence of `needle` in `haystack` closest to the anchor
+ * span. Tries case-sensitive first, then case-insensitive, and searches
+ * the whole document rather than a narrow window so a text that
+ * happens to match elsewhere is still accepted. Reduces false
+ * "edited text not found" chips.
+ */
+function findClosestOccurrence(haystack, needle, origStart, origEnd) {
+  const anchor = Math.floor(((origStart != null ? origStart : 0) + (origEnd != null ? origEnd : needle.length)) / 2);
+  const scan = (hay, nee) => {
+    const positions = [];
+    let idx = 0;
+    while (true) {
+      const p = hay.indexOf(nee, idx);
+      if (p === -1) break;
+      positions.push(p);
+      idx = p + 1;
+      if (positions.length > 40) break;
+    }
+    return positions;
+  };
+  let positions = scan(haystack, needle);
+  if (!positions.length) positions = scan(haystack.toLowerCase(), needle.toLowerCase());
+  if (!positions.length) return null;
+  let best = positions[0];
+  let bestDist = Math.abs(best - anchor);
+  for (let i = 1; i < positions.length; i++) {
+    const d = Math.abs(positions[i] - anchor);
+    if (d < bestDist) { best = positions[i]; bestDist = d; }
+  }
+  return best;
 }
 
 /**
@@ -2095,6 +2144,7 @@ function refreshRow(rowEl, decision) {
   const tokenCell = rowEl.children[3];
   actionCell.innerHTML = renderActionSelect(decision);
   tokenCell.innerHTML = renderTokenControl(decision);
+  if (decision.action === 'preserve') markInvalidText(rowEl, false);
 }
 
 function isUnresolved(d) {
