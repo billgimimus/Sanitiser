@@ -2453,6 +2453,7 @@ const state = {
   watchlist: { version: 1, entries: [] },
   nerPipeline: null,
   nerLoading: false,
+  selectedForBatch: new Set(),
 };
 
 document.addEventListener('DOMContentLoaded', init);
@@ -2577,13 +2578,22 @@ function renderSidebar() {
         const fitem = document.createElement('div');
         fitem.className = 'file-item' + (state.selectedFile === f.name ? ' selected' : '');
         const badge = f.hasSanitised ? '<span class="file-badge done">sanitised</span>' : '<span class="file-badge">raw</span>';
-        fitem.innerHTML = `<span class="file-item-name">${escapeHtml(f.name)}</span><span class="file-item-right">${badge}<button class="file-item-del" data-role="delete" title="Delete this file from the case" type="button">×</button></span>`;
+        const checked = state.selectedForBatch && state.selectedForBatch.has(`${c.id}::${f.name}`) ? ' checked' : '';
+        const ckAttrs = f.hasSanitised ? '' : ' disabled title="This file has not been sanitised yet."';
+        fitem.innerHTML = `<label class="file-item-batch" style="display:inline-flex;align-items:center;margin-right:6px;" title="Include this file in the multi-file Copy sanitised."><input type="checkbox" data-role="batch"${ckAttrs}${checked} style="cursor:pointer;"></label><span class="file-item-name">${escapeHtml(f.name)}</span><span class="file-item-right">${badge}<button class="file-item-del" data-role="delete" title="Delete this file from the case" type="button">×</button></span>`;
         fitem.addEventListener('click', (ev) => {
           if (ev.target.dataset && ev.target.dataset.role === 'delete') {
             ev.stopPropagation();
             onDeleteFile(c, f.name);
             return;
           }
+          if (ev.target.dataset && ev.target.dataset.role === 'batch') {
+            ev.stopPropagation();
+            toggleBatchSelection(c.id, f.name, ev.target.checked);
+            renderBatchBar();
+            return;
+          }
+          if (ev.target.tagName === 'LABEL') { ev.stopPropagation(); return; }
           ev.stopPropagation();
           selectFile(f.name);
         });
@@ -2611,6 +2621,11 @@ function renderSidebar() {
         btnRename.title = 'Rename the case, for example when an R-number is escalated to an A-number.';
         btnRename.addEventListener('click', (ev) => { ev.stopPropagation(); onRenameCase(c); });
         actions.appendChild(btnRename);
+        const btnAudit = document.createElement('button');
+        btnAudit.textContent = 'Audit log';
+        btnAudit.title = 'View the case audit log inside the tool.';
+        btnAudit.addEventListener('click', (ev) => { ev.stopPropagation(); onViewAuditLog(c); });
+        actions.appendChild(btnAudit);
         const btnClose = document.createElement('button');
         btnClose.textContent = 'Close case';
         btnClose.addEventListener('click', (ev) => { ev.stopPropagation(); onCloseCase(c); });
@@ -2680,6 +2695,33 @@ async function handleDroppedFile(caseObj, file, emlSummaries) {
       const buf = await file.arrayBuffer();
       const savedName = await writeRawUnique(caseObj.rawHandle, file.name, buf);
       showToast(`Could not parse ${file.name} as email (${err.message}); saved raw instead. Use "Paste text as new file" for the content you want to sanitise.`, true);
+      return savedName;
+    }
+  }
+  if (/\.(png|jpg|jpeg|bmp|webp|gif)$/.test(lower)) {
+    if (!window.Tesseract) {
+      const buf = await file.arrayBuffer();
+      const savedName = await writeRawUnique(caseObj.rawHandle, file.name, buf);
+      showToast('Image OCR requires lib/tesseract.min.js in the same folder. Saved raw for now.', true);
+      return savedName;
+    }
+    try {
+      const buf = await file.arrayBuffer();
+      const parsed = await parseImageOcr(buf, file.name, (label) => {
+        showToast(`OCR: ${label}`);
+      });
+      const savedName = await writeUnique(caseObj.rawHandle, replaceExtension(file.name, '.txt'), parsed.text);
+      emlSummaries.push({
+        sourceName: file.name,
+        savedName,
+        attachments: [],
+        warnings: parsed.warnings,
+      });
+      return savedName;
+    } catch (err) {
+      const buf = await file.arrayBuffer();
+      const savedName = await writeRawUnique(caseObj.rawHandle, file.name, buf);
+      showToast(`Could not OCR ${file.name} (${err.message}); saved raw. First OCR needs an internet connection to download the language model.`, true);
       return savedName;
     }
   }
@@ -2756,6 +2798,49 @@ let pdfWorkerConfigured = false;
  * Returns the same shape the other importers use so it can flow through
  * the shared summary and audit path.
  */
+/**
+ * OCR an image file using Tesseract.js. The library and its runtime
+ * dependencies (worker, WASM, English language data) are fetched from
+ * jsdelivr and tessdata.projectnaptha.com on first use. Both are
+ * CORS-permissive so this works from a file:// origin. Subsequent OCRs
+ * hit the browser's Cache and IndexedDB caches and are offline.
+ *
+ * Returns a `{ text, warnings }` payload in the shape formatEmlAsText
+ * consumers expect.
+ */
+async function parseImageOcr(arrayBuffer, sourceName, updateProgress) {
+  if (typeof window.Tesseract !== 'function' && typeof window.Tesseract !== 'object') {
+    throw new Error('Tesseract.js not loaded (check lib/tesseract.min.js).');
+  }
+  const blob = new Blob([arrayBuffer]);
+  const url = URL.createObjectURL(blob);
+  try {
+    const result = await window.Tesseract.recognize(url, 'eng', {
+      logger: (m) => {
+        if (updateProgress && m && typeof m.status === 'string') {
+          const pct = typeof m.progress === 'number' ? Math.round(m.progress * 100) : null;
+          updateProgress(pct != null ? `${m.status} ${pct}%` : m.status);
+        }
+      },
+    });
+    const confidence = result && result.data && typeof result.data.confidence === 'number'
+      ? result.data.confidence
+      : null;
+    const rawText = result && result.data && result.data.text ? result.data.text : '';
+    const warnings = [];
+    if (!rawText.trim()) warnings.push('OCR returned no text. The image may be blank, blurry, or non-textual.');
+    if (confidence != null && confidence < 60) warnings.push(`Overall OCR confidence is low (${confidence.toFixed(1)}%). Cross-check the extracted text against the source image before sanitising.`);
+    const headerLines = [
+      `# OCR extracted from image: ${sourceName}`,
+    ];
+    if (confidence != null) headerLines.push(`# OCR confidence: ${confidence.toFixed(1)}%`);
+    headerLines.push('# Review the extracted text against the source image before sanitising.', '');
+    return { text: headerLines.join('\n') + rawText, warnings, confidence };
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
 async function parsePdf(arrayBuffer, sourceName) {
   const pdfjs = window.pdfjsLib;
   if (!pdfWorkerConfigured) {
@@ -2985,9 +3070,12 @@ function classifyUnsupported(name) {
     ['.pdf', 'PDFs need to be extracted to text before sanitisation.'],
     ['.msg', 'Outlook .msg files are binary; the tool needs to parse them to text first.'],
     ['.eml', 'Email files need to be parsed to a text form before sanitisation.'],
-    ['.png', 'Image files are not yet extracted (OCR support arrives in a follow-up commit). For now, open the image in a viewer that can extract text (Windows Snipping Tool has an OCR button, Google Lens on your phone works too), then use "Paste text as new file".'],
-    ['.jpg', 'Image files are not yet extracted (OCR support arrives in a follow-up commit). For now, open the image in a viewer that can extract text (Windows Snipping Tool has an OCR button, Google Lens on your phone works too), then use "Paste text as new file".'],
-    ['.jpeg', 'Image files are not yet extracted (OCR support arrives in a follow-up commit). For now, open the image in a viewer that can extract text (Windows Snipping Tool has an OCR button, Google Lens on your phone works too), then use "Paste text as new file".'],
+    ['.png', 'Image files need OCR before sanitisation.'],
+    ['.jpg', 'Image files need OCR before sanitisation.'],
+    ['.jpeg', 'Image files need OCR before sanitisation.'],
+    ['.bmp', 'Image files need OCR before sanitisation.'],
+    ['.webp', 'Image files need OCR before sanitisation.'],
+    ['.gif', 'Image files need OCR before sanitisation.'],
     ['.doc', 'Legacy .doc format is not supported. Copy the text out and paste it back in.'],
     ['.docx', '.docx files are not yet parsed. Copy the text out and paste it back in.'],
     ['.xls', 'Excel files are not supported.'],
@@ -3025,9 +3113,13 @@ function renderUnsupportedFileView(name, caseObj, reason) {
   document.getElementById('file-name').textContent = name;
   document.getElementById('file-case').textContent = `Case ${caseObj.id}`;
   const lower = name.toLowerCase();
-  const extractable = lower.endsWith('.pdf') || lower.endsWith('.msg') || lower.endsWith('.eml');
+  const isImage = /\.(png|jpg|jpeg|bmp|webp|gif)$/.test(lower);
+  const extractable = lower.endsWith('.pdf') || lower.endsWith('.msg') || lower.endsWith('.eml') || isImage;
+  const extractLabel = isImage ? 'Extract text with OCR' : 'Extract to text';
   const banner = extractable
-    ? `${escapeHtml(reason)} Click <strong>Extract to text</strong> below to run the tool's parser on ${escapeHtml(name)} and save the result as a .txt sibling ready to sanitise. If extraction fails, use "Paste text as new file" on the case row instead.`
+    ? (isImage
+        ? `${escapeHtml(reason)} Click <strong>Extract text with OCR</strong> below to run Tesseract on ${escapeHtml(name)} and save the recognised text as a .txt sibling. Wait for the download the first time (the English OCR model is fetched from the CDN once, then cached). If it fails, use "Paste text as new file" instead.`
+        : `${escapeHtml(reason)} Click <strong>Extract to text</strong> below to run the tool's parser on ${escapeHtml(name)} and save the result as a .txt sibling ready to sanitise. If extraction fails, use "Paste text as new file" on the case row instead.`)
     : `This file cannot be shown or sanitised in its current form. ${escapeHtml(reason)} As a failsafe, use "Paste text as new file" on the case row: open ${escapeHtml(name)} in its native viewer, copy the text you want to send to Claude, and paste it in. The tool saves the pasted text as a .txt inside the case and sanitises it normally.`;
   const pre = document.getElementById('original-content');
   pre.innerHTML = '';
@@ -3039,7 +3131,7 @@ function renderUnsupportedFileView(name, caseObj, reason) {
     const btn = document.createElement('button');
     btn.className = 'primary';
     btn.style.marginTop = '12px';
-    btn.textContent = 'Extract to text';
+    btn.textContent = extractLabel;
     btn.addEventListener('click', () => onExtractExistingFile(caseObj, name));
     pre.appendChild(btn);
   }
@@ -3214,6 +3306,66 @@ async function persistSafeListUpdates(mapping, updates) {
   if (addedCase) parts.push(`${addedCase} added to case safe list`);
   if (addedGlobal) parts.push(`${addedGlobal} added to global safe list`);
   return parts.join(', ');
+}
+
+/**
+ * Multi-file clipboard: tick sanitised files in the sidebar, then Copy
+ * concatenates them into one clipboard payload with clear file-separator
+ * headers. Rehydration then works against whichever case they came from.
+ */
+function toggleBatchSelection(caseId, fileName, checked) {
+  const key = `${caseId}::${fileName}`;
+  if (checked) state.selectedForBatch.add(key);
+  else state.selectedForBatch.delete(key);
+}
+
+function renderBatchBar() {
+  const existing = document.getElementById('batch-bar');
+  if (existing) existing.remove();
+  if (state.selectedForBatch.size === 0) return;
+  const bar = document.createElement('div');
+  bar.id = 'batch-bar';
+  bar.style.cssText = 'position:fixed;bottom:32px;right:24px;background:var(--topbar);color:#fff;padding:8px 12px;border-radius:6px;box-shadow:var(--shadow-toast);display:flex;gap:8px;align-items:center;z-index:150;';
+  bar.innerHTML = `
+    <span style="font-size:12px;">${state.selectedForBatch.size} file${state.selectedForBatch.size === 1 ? '' : 's'} selected</span>
+    <button id="batch-copy" class="primary" style="height:26px;padding:0 10px;">Copy sanitised (concat)</button>
+    <button id="batch-clear" style="height:26px;padding:0 10px;">Clear</button>
+  `;
+  document.body.appendChild(bar);
+  bar.querySelector('#batch-copy').addEventListener('click', onCopySanitisedBatch);
+  bar.querySelector('#batch-clear').addEventListener('click', () => {
+    state.selectedForBatch.clear();
+    renderBatchBar();
+    renderSidebar();
+  });
+}
+
+async function onCopySanitisedBatch() {
+  if (state.selectedForBatch.size === 0) return;
+  const chunks = [];
+  const missing = [];
+  for (const key of state.selectedForBatch) {
+    const [caseId, name] = key.split('::');
+    const c = state.cases.find((x) => x.id === caseId);
+    if (!c) { missing.push(key); continue; }
+    try {
+      const { text } = await readFileText(c.sanHandle, name);
+      chunks.push(`\n\n===== ${caseId} / ${name} =====\n\n${text}`);
+    } catch (_e) {
+      missing.push(key);
+    }
+  }
+  if (!chunks.length) {
+    showToast('Nothing to copy: none of the ticked files have a sanitised version yet.', true);
+    return;
+  }
+  const payload = `# Multi-file sanitised bundle: ${chunks.length} file(s)\n${chunks.join('')}`;
+  try {
+    await copyText(payload, `${chunks.length} sanitised files`);
+    showToast(`Copied ${chunks.length} sanitised file${chunks.length === 1 ? '' : 's'}${missing.length ? `, ${missing.length} skipped` : ''}.`);
+  } catch (err) {
+    showToast(err.message, true);
+  }
 }
 
 async function onCopySanitised() {
@@ -3503,6 +3655,51 @@ async function onRefreshCases() {
  * and writes through to the raw folder, sanitised mirror, mapping,
  * closure log, and watchlist.
  */
+/**
+ * Show the case's audit log (_audit.log) in a scrollable modal so the
+ * adviser can inspect what has happened to the case without leaving
+ * the tool. Each entry is one tab-separated line "ISO_TIMESTAMP\ttext".
+ */
+async function onViewAuditLog(caseObj) {
+  let lines = [];
+  try {
+    const { text } = await readFileText(caseObj.rawHandle, '_audit.log');
+    lines = text.split('\n').filter((l) => l.trim());
+  } catch (_e) {
+    lines = [];
+  }
+  const root = document.getElementById('dialog-root');
+  root.innerHTML = '';
+  const backdrop = document.createElement('div');
+  backdrop.className = 'modal-backdrop';
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+  modal.style.width = '780px';
+  backdrop.appendChild(modal);
+  const rows = lines.length
+    ? lines.map((line) => {
+        const idx = line.indexOf('\t');
+        const stamp = idx > 0 ? line.slice(0, idx) : '';
+        const rest = idx > 0 ? line.slice(idx + 1) : line;
+        return `<tr><td style="white-space:nowrap;font-family:var(--mono);font-size:11px;color:var(--muted);padding:4px 8px;">${escapeHtml(stamp)}</td><td style="padding:4px 8px;">${escapeHtml(rest)}</td></tr>`;
+      }).reverse().join('')
+    : '<tr><td colspan="2" class="muted" style="padding:12px;">No audit entries yet.</td></tr>';
+  modal.innerHTML = `
+    <div class="modal-header">Audit log: ${escapeHtml(caseObj.id)}</div>
+    <div class="modal-body">
+      <p class="muted">Newest first. The log is written on every sanitisation, rehydration, file add, delete, and lifecycle event. It lives at <code>_audit.log</code> inside the case folder if you want a copy.</p>
+      <table style="width:100%;border-collapse:collapse;">${rows}</table>
+    </div>
+    <div class="modal-footer">
+      <button class="primary" data-action="ok">Close</button>
+    </div>
+  `;
+  modal.addEventListener('click', (ev) => {
+    if (ev.target.dataset && ev.target.dataset.action === 'ok') backdrop.remove();
+  });
+  root.appendChild(backdrop);
+}
+
 async function onRenameCase(caseObj) {
   const raw = prompt(`Rename case "${caseObj.id}" to:\n\n(For example, updating an R-number to an A-number when a case is escalated. Letters, digits and hyphens only.)`, caseObj.id);
   if (raw == null) return;
@@ -3537,7 +3734,8 @@ async function onRenameCase(caseObj) {
  */
 async function onExtractExistingFile(caseObj, name) {
   const lower = name.toLowerCase();
-  if (!(lower.endsWith('.pdf') || lower.endsWith('.msg') || lower.endsWith('.eml'))) {
+  const isImage = /\.(png|jpg|jpeg|bmp|webp|gif)$/.test(lower);
+  if (!(lower.endsWith('.pdf') || lower.endsWith('.msg') || lower.endsWith('.eml') || isImage)) {
     showToast('This file cannot be extracted automatically. Use "Paste text as new file" to bring its content in.', true);
     return;
   }

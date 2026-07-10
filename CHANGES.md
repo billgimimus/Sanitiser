@@ -45,6 +45,14 @@ Built:
 - Binary heuristic fallback for files with unfamiliar extensions: if the first kilobyte contains more than 5% control characters (excluding tab, CR, LF), the file is treated as unsupported.
 - Audit log now records paste-text events with the optional source note.
 
+## Phase 3.1: OCR, audit log viewer, multi-file clipboard
+
+Three phase 3 features.
+
+- **Image OCR via Tesseract.js.** Vendored `lib/tesseract.min.js` (68 KB). Dropping (or opening in-place) a `.png`, `.jpg`, `.jpeg`, `.bmp`, `.webp`, or `.gif` now offers **Extract text with OCR**. Tesseract's worker, WASM, and English language model are fetched from jsdelivr and tessdata.projectnaptha.com on first use (both CORS-permissive) and cached by the browser. Confidence and any low-confidence warnings are recorded in the saved text and the audit log. Client photos of documents can now flow through the tool.
+- **Audit log viewer.** Every open case gets an **Audit log** button that opens a scrollable modal showing every entry from `_audit.log` newest-first: sanitisations, rehydrations, adds, deletes, renames, closures, verbatim mismatches, safe-list additions. The log file on disk stays the canonical record.
+- **Multi-file clipboard concatenation.** Every sanitised file in the sidebar has a checkbox. Tick two or more, and a floating action bar appears with **Copy sanitised (concat)** and **Clear**. Concat produces one clipboard payload with clear `===== CASE / FILENAME =====` separators between files, so a whole-case briefing can be pasted to Claude in one go.
+
 ## Phase 2.6: Optional NER (Xenova/bert-base-NER)
 
 Add opt-in named-entity recognition using Transformers.js + Xenova/bert-base-NER. Off by default; toggle in the top toolbar labelled "Enhanced detection (NER)". First activation warns about the ~50 MB model download from huggingface.co, loads the pipeline, and persists `nerEnabled: true` in `_settings.json`. Subsequent activations are offline (cached by the browser's Cache API).
