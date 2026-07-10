@@ -607,6 +607,21 @@ async function moveDirectory(fromParent, toParent, name) {
   await fromParent.removeEntry(name, { recursive: true });
 }
 
+/**
+ * Rename a directory inside the same parent. Uses the native
+ * DirectoryHandle.move() when the browser supports it (Chrome 111+);
+ * falls back to the copy-tree-and-delete pattern otherwise.
+ */
+async function renameDirectory(parent, oldName, newName) {
+  const src = await parent.getDirectoryHandle(oldName);
+  if (typeof src.move === 'function') {
+    try { await src.move(newName); return; } catch (_e) { /* fall through */ }
+  }
+  const dst = await parent.getDirectoryHandle(newName, { create: true });
+  await copyTree(src, dst);
+  await parent.removeEntry(oldName, { recursive: true });
+}
+
 async function copyTree(src, dst) {
   for await (const entry of src.values()) {
     if (entry.kind === 'file') {
@@ -1768,6 +1783,46 @@ async function createCase(handles, caseId) {
   return { rawHandle, sanHandle };
 }
 
+/**
+ * Rename a case in place: raw folder, sanitised mirror, and the caseId
+ * field inside _mapping.json and _closure.json. Also updates any
+ * watchlist entries pointing at the old case ID so cross-case checks
+ * keep working. Files inside the case (test files, sanitised outputs,
+ * audit log) keep their content unchanged.
+ */
+async function renameCase(handles, caseObj, newId, watchlist) {
+  const closed = caseObj.kind === 'closed';
+  const rawParent = closed ? handles.closedRaw : handles.activeRaw;
+  const sanParent = closed ? handles.closedSan : handles.activeSan;
+  // Collision check.
+  try {
+    await rawParent.getDirectoryHandle(newId);
+    throw new Error(`A case called "${newId}" already exists.`);
+  } catch (err) {
+    if (err && err.name !== 'NotFoundError') throw err;
+  }
+  await renameDirectory(rawParent, caseObj.id, newId);
+  try { await renameDirectory(sanParent, caseObj.id, newId); } catch (_e) { /* mirror not present yet */ }
+  const newRawHandle = await rawParent.getDirectoryHandle(newId);
+  const mapping = await loadMapping(newRawHandle, newId);
+  const oldId = mapping.caseId;
+  mapping.caseId = newId;
+  await saveMapping(newRawHandle, mapping);
+  const closure = await readJSON(newRawHandle, CLOSURE_FILENAME);
+  if (closure) {
+    closure.caseId = newId;
+    closure.events = closure.events || [];
+    closure.events.push({ type: 'renamed', at: new Date().toISOString(), from: oldId, to: newId });
+    await writeJSON(newRawHandle, CLOSURE_FILENAME, closure);
+  }
+  if (watchlist && Array.isArray(watchlist.entries)) {
+    for (const entry of watchlist.entries) {
+      if (entry.caseId === caseObj.id) entry.caseId = newId;
+    }
+  }
+  await appendAudit(newRawHandle, `Case renamed from ${caseObj.id} to ${newId}`);
+}
+
 async function closeCase(handles, caseObj, { reason, note }) {
   const closure = (await readJSON(caseObj.rawHandle, CLOSURE_FILENAME)) || {
     version: 1,
@@ -1881,6 +1936,7 @@ function openReviewDialog(entities, mapping, options = {}) {
       <div class="modal-header">Review detected entities: ${escapeHtml(options.title || 'file')}</div>
       <div class="modal-body">
         ${renderPriorAppearanceBanner(options.priorSummary)}
+        ${options.autoAppliedCount ? `<div class="muted" style="background:var(--panel-alt);border:1px solid var(--border);border-radius:4px;padding:8px 12px;margin-bottom:10px;">${options.autoAppliedCount} identifier${options.autoAppliedCount === 1 ? '' : 's'} already in this case's mapping will be tokenised automatically. They are not shown below.</div>` : ''}
         <p class="muted">The detected text on the left is editable, so you can trim a wrongly captured boundary (for example changing "Hi Kieran" to "Kieran"). Use "Safe here" or "Safe everywhere" to record that a specific string should be skipped by future detection.</p>
         <div id="review-summary" class="muted" style="margin-bottom:8px"></div>
         <table class="entity-table">
@@ -2411,6 +2467,8 @@ function init() {
   primeReopenButton();
   document.getElementById('btn-new-case').addEventListener('click', onNewCase);
   document.getElementById('btn-paste-rehydrate').addEventListener('click', onPasteRehydrate);
+  const refreshBtn = document.getElementById('btn-refresh-cases');
+  if (refreshBtn) refreshBtn.addEventListener('click', onRefreshCases);
   document.querySelectorAll('#sidebar .tab').forEach((btn) => {
     btn.addEventListener('click', () => switchSidebarView(btn.dataset.view));
   });
@@ -2548,6 +2606,11 @@ function renderSidebar() {
         btnPaste.title = 'Failsafe for content the tool cannot yet extract from PDFs or .msg files. Paste in the text, name the file, and the tool saves it as a .txt inside the case.';
         btnPaste.addEventListener('click', (ev) => { ev.stopPropagation(); onPasteTextToCase(c); });
         actions.appendChild(btnPaste);
+        const btnRename = document.createElement('button');
+        btnRename.textContent = 'Rename';
+        btnRename.title = 'Rename the case, for example when an R-number is escalated to an A-number.';
+        btnRename.addEventListener('click', (ev) => { ev.stopPropagation(); onRenameCase(c); });
+        actions.appendChild(btnRename);
         const btnClose = document.createElement('button');
         btnClose.textContent = 'Close case';
         btnClose.addEventListener('click', (ev) => { ev.stopPropagation(); onCloseCase(c); });
@@ -2919,15 +2982,16 @@ async function selectFile(name) {
 function classifyUnsupported(name) {
   const lower = name.toLowerCase();
   const map = [
-    ['.pdf', 'PDFs are extracted on drop. This file is a raw copy left over from before PDF support arrived; delete and re-drop the source to import it as text.'],
-    ['.msg', 'Outlook .msg files are parsed on drop. This file is a raw copy left over from before .msg support arrived; delete and re-drop the source to import it as text.'],
+    ['.pdf', 'PDFs need to be extracted to text before sanitisation.'],
+    ['.msg', 'Outlook .msg files are binary; the tool needs to parse them to text first.'],
+    ['.eml', 'Email files need to be parsed to a text form before sanitisation.'],
+    ['.png', 'Image files are not yet extracted (OCR support arrives in a follow-up commit). For now, open the image in a viewer that can extract text (Windows Snipping Tool has an OCR button, Google Lens on your phone works too), then use "Paste text as new file".'],
+    ['.jpg', 'Image files are not yet extracted (OCR support arrives in a follow-up commit). For now, open the image in a viewer that can extract text (Windows Snipping Tool has an OCR button, Google Lens on your phone works too), then use "Paste text as new file".'],
+    ['.jpeg', 'Image files are not yet extracted (OCR support arrives in a follow-up commit). For now, open the image in a viewer that can extract text (Windows Snipping Tool has an OCR button, Google Lens on your phone works too), then use "Paste text as new file".'],
     ['.doc', 'Legacy .doc format is not supported. Copy the text out and paste it back in.'],
     ['.docx', '.docx files are not yet parsed. Copy the text out and paste it back in.'],
     ['.xls', 'Excel files are not supported.'],
     ['.xlsx', 'Excel files are not supported.'],
-    ['.png', 'Image files are not supported. Phase 2 adds OCR (Tesseract) if needed.'],
-    ['.jpg', 'Image files are not supported. Phase 2 adds OCR (Tesseract) if needed.'],
-    ['.jpeg', 'Image files are not supported. Phase 2 adds OCR (Tesseract) if needed.'],
     ['.gif', 'Image files are not supported.'],
     ['.zip', 'Archive files are not opened by the tool.'],
   ];
@@ -2960,13 +3024,25 @@ function renderUnsupportedFileView(name, caseObj, reason) {
   document.getElementById('file-view').hidden = false;
   document.getElementById('file-name').textContent = name;
   document.getElementById('file-case').textContent = `Case ${caseObj.id}`;
-  const banner = `This file cannot be shown or sanitised in its current form. ${escapeHtml(reason)} As a failsafe, use "Paste text as new file" on the case row: open ${escapeHtml(name)} in its native viewer, copy the text you want to send to Claude, and paste it in. The tool saves the pasted text as a .txt inside the case and sanitises it normally.`;
+  const lower = name.toLowerCase();
+  const extractable = lower.endsWith('.pdf') || lower.endsWith('.msg') || lower.endsWith('.eml');
+  const banner = extractable
+    ? `${escapeHtml(reason)} Click <strong>Extract to text</strong> below to run the tool's parser on ${escapeHtml(name)} and save the result as a .txt sibling ready to sanitise. If extraction fails, use "Paste text as new file" on the case row instead.`
+    : `This file cannot be shown or sanitised in its current form. ${escapeHtml(reason)} As a failsafe, use "Paste text as new file" on the case row: open ${escapeHtml(name)} in its native viewer, copy the text you want to send to Claude, and paste it in. The tool saves the pasted text as a .txt inside the case and sanitises it normally.`;
   const pre = document.getElementById('original-content');
   pre.innerHTML = '';
   const div = document.createElement('div');
   div.className = 'warning';
   div.innerHTML = banner;
   pre.appendChild(div);
+  if (extractable) {
+    const btn = document.createElement('button');
+    btn.className = 'primary';
+    btn.style.marginTop = '12px';
+    btn.textContent = 'Extract to text';
+    btn.addEventListener('click', () => onExtractExistingFile(caseObj, name));
+    pre.appendChild(btn);
+  }
   document.getElementById('sanitised-content').textContent = '';
   document.getElementById('sanitised-status').textContent = 'Not applicable for this file type.';
   document.getElementById('stale-warning').hidden = true;
@@ -3029,18 +3105,30 @@ async function onSanitise() {
     }
   }
   const entities = crossCheckWatchlist(mergedEntities, state.watchlist, c.id);
+  // Entities already recorded in the case mapping are auto-tokenised
+  // without appearing in the review dialog. The adviser has already
+  // approved these; showing them again is noise.
+  const knownEntities = entities.filter((e) => e.known && e.known.token);
+  const unknownEntities = entities.filter((e) => !e.known || !e.known.token);
   const priorSummary = summarisePriorAppearances(entities);
-  const result = await openReviewDialog(entities, mapping, {
+  const result = await openReviewDialog(unknownEntities, mapping, {
     title: state.selectedFile,
     documentText: state.currentText,
     priorSummary,
+    autoAppliedCount: knownEntities.length,
   });
   if (!result) return;
   for (const upd of result.mappingUpdates) {
     if (upd.aliasFor) addAlias(mapping, upd.aliasFor, upd.alias);
   }
   const safeAudit = await persistSafeListUpdates(mapping, result.safeListUpdates || []);
-  const sanitisedRaw = applySanitisation(state.currentText, result.decisions);
+  const autoDecisions = knownEntities.map((e) => ({
+    ...e,
+    action: 'tokenise',
+    token: e.known.token,
+  }));
+  const allDecisions = [...autoDecisions, ...result.decisions].sort((a, b) => a.start - b.start);
+  const sanitisedRaw = applySanitisation(state.currentText, allDecisions);
   let sanitised;
   let verbatimIds = [];
   try {
@@ -3059,7 +3147,7 @@ async function onSanitise() {
   const header = buildHeader({
     caseId: c.id,
     sourceName: state.selectedFile,
-    tokensUsed: result.decisions.filter((d) => d.action === 'tokenise').map((d) => d.token),
+    tokensUsed: allDecisions.filter((d) => d.action === 'tokenise').map((d) => d.token),
     sanitisedDateISO: new Date().toISOString(),
     verbatimCount: verbatimIds.length,
   });
@@ -3070,7 +3158,8 @@ async function onSanitise() {
   if (added) await saveWatchlist(state.handles.root, state.watchlist);
   const verbatimAudit = verbatimIds.length ? `; ${verbatimIds.length} verbatim block(s)` : '';
   const watchlistAudit = added ? `; ${added} new watchlist entrie(s)` : '';
-  await appendAudit(c.rawHandle, `Sanitised: ${state.selectedFile} (${result.decisions.length} decisions, ${result.mappingUpdates.length} new mapping entries)${safeAudit ? `; ${safeAudit}` : ''}${verbatimAudit}${watchlistAudit}`);
+  const autoNote = autoDecisions.length ? `; ${autoDecisions.length} auto-applied from mapping` : '';
+  await appendAudit(c.rawHandle, `Sanitised: ${state.selectedFile} (${result.decisions.length} reviewed decisions, ${result.mappingUpdates.length} new mapping entries)${autoNote}${safeAudit ? `; ${safeAudit}` : ''}${verbatimAudit}${watchlistAudit}`);
   state.currentMapping = mapping;
   await selectFile(state.selectedFile);
   showToast(verbatimIds.length ? `Sanitised file written with ${verbatimIds.length} verbatim block(s).` : 'Sanitised file written.');
@@ -3391,6 +3480,80 @@ async function onNewCase() {
     showToast(`Case ${trimmed} created.`);
   } catch (err) {
     showToast(`Could not create case: ${err.message}`, true);
+  }
+}
+
+/**
+ * Refresh the case list, reading whatever is now on disk. Used after
+ * external tools (SharePoint sync, Explorer) add or remove case
+ * folders or files, since a browser cannot watch the filesystem for
+ * changes.
+ */
+async function onRefreshCases() {
+  if (!state.handles) {
+    showToast('Open a casework folder first.', true);
+    return;
+  }
+  await refreshCases();
+  showToast('Case list refreshed.');
+}
+
+/**
+ * Rename an open or closed case. Prompts for the new ID, validates,
+ * and writes through to the raw folder, sanitised mirror, mapping,
+ * closure log, and watchlist.
+ */
+async function onRenameCase(caseObj) {
+  const raw = prompt(`Rename case "${caseObj.id}" to:\n\n(For example, updating an R-number to an A-number when a case is escalated. Letters, digits and hyphens only.)`, caseObj.id);
+  if (raw == null) return;
+  const trimmed = raw.trim();
+  if (!trimmed) return;
+  if (trimmed === caseObj.id) return;
+  if (!/^[A-Z0-9\-]{2,32}$/i.test(trimmed)) {
+    showToast('Case IDs may only contain letters, digits, and hyphens.', true);
+    return;
+  }
+  if (state.cases.some((c) => c.id.toLowerCase() === trimmed.toLowerCase() && c.kind === caseObj.kind)) {
+    showToast(`A case called "${trimmed}" already exists in this view.`, true);
+    return;
+  }
+  try {
+    await renameCase(state.handles, caseObj, trimmed, state.watchlist);
+    if (state.watchlist) await saveWatchlist(state.handles.root, state.watchlist);
+    if (state.selectedCaseId === caseObj.id) state.selectedCaseId = trimmed;
+    await refreshCases();
+    showToast(`Renamed to ${trimmed}.`);
+  } catch (err) {
+    showToast(`Could not rename: ${err.message}`, true);
+  }
+}
+
+/**
+ * Extract a supported binary file (PDF, .msg, .eml) that already lives
+ * inside a case folder, saving the parsed text as a `.txt` sibling and
+ * opening it for sanitisation. Same code path as the drop handler; the
+ * only difference is the source (an existing file in the case rather
+ * than a File object from a drop event).
+ */
+async function onExtractExistingFile(caseObj, name) {
+  const lower = name.toLowerCase();
+  if (!(lower.endsWith('.pdf') || lower.endsWith('.msg') || lower.endsWith('.eml'))) {
+    showToast('This file cannot be extracted automatically. Use "Paste text as new file" to bring its content in.', true);
+    return;
+  }
+  try {
+    const handle = await caseObj.rawHandle.getFileHandle(name);
+    const file = await handle.getFile();
+    const summaries = [];
+    const savedName = await handleDroppedFile(caseObj, file, summaries);
+    await appendAudit(caseObj.rawHandle, `Extracted: ${name} -> ${savedName}`);
+    await refreshCases();
+    await selectCase(caseObj.id);
+    await selectFile(savedName);
+    if (summaries.length) showEmailImportSummary(summaries);
+    else showToast(`Extracted ${name} to ${savedName}.`);
+  } catch (err) {
+    showToast(`Could not extract ${name}: ${err.message}`, true);
   }
 }
 
