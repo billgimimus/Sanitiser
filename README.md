@@ -8,7 +8,9 @@ This build implements the phase 1 scope described in the design spec: filesystem
 
 ## Open the tool
 
-Open `index.html` in Chrome, Edge, or Opera. Other browsers do not expose the File System Access API. There is no server, no build step, and no dependencies to install.
+Double-click `index.html`. It opens in Chrome, Edge, or Opera. Other browsers do not expose the File System Access API. There is no server, no build step, and no dependencies to install.
+
+If the page shows a red banner saying the tool did not start, one of two things is likely: `js/app.js` was not copied across into the same folder as `index.html`, or the browser is out of date. Press F12 to open the developer tools; the Console tab shows the exact error.
 
 ## First run
 

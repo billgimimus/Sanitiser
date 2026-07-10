@@ -31,3 +31,5 @@ Deferrals and known limitations:
 Deviations from the spec:
 
 - The project is laid out at the git repository root rather than inside a `casework-sanitiser/` subdirectory. The repository is dedicated to this tool, so the extra nesting adds nothing.
+- The JavaScript is shipped as a single concatenated `js/app.js` rather than a tree of ES modules under `js/`. The briefing asked for both "ES modules split across files" and "must run by opening index.html directly", which are in genuine conflict: Chromium browsers refuse to load ES modules from `file://` URLs. Given the choice between shipping module structure and needing a local static server, or shipping one flat file and having double-click work, we chose the latter. Section markers in `js/app.js` preserve the module boundaries for navigation. Any future editing happens in `app.js` directly.
+- A fallback banner in `index.html` shows a visible error if `js/app.js` fails to load or execute, so the failure mode observed on first ship is not silent again.

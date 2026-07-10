@@ -76,6 +76,25 @@
     <div id="toast-root" aria-live="polite"></div>
   </div>
 
-  <script type="module" src="js/main.js"></script>
+  <script>
+    // If the main script fails to load or throws before it registers a
+    // start marker, surface a visible banner rather than leaving the
+    // adviser with a dead page. Common causes: js/app.js missing from
+    // the folder copy, or a browser-side syntax error.
+    window.__sanitiserLoaded = false;
+    window.addEventListener('DOMContentLoaded', () => {
+      setTimeout(() => {
+        if (window.__sanitiserLoaded) return;
+        const welcome = document.getElementById('welcome');
+        if (!welcome) return;
+        const banner = document.createElement('div');
+        banner.className = 'error';
+        banner.style.marginBottom = '12px';
+        banner.textContent = 'The tool did not start. Check that js/app.js is in the same folder as index.html, then reload. Open DevTools (F12) to see the exact error.';
+        welcome.prepend(banner);
+      }, 1500);
+    });
+  </script>
+  <script src="js/app.js"></script>
 </body>
 </html>
