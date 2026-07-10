@@ -368,6 +368,13 @@ code {
   color: var(--topbar);
   font-size: 13px;
 }
+.case-item .case-client {
+  font-family: var(--sans, inherit);
+  font-weight: 500;
+  color: var(--muted);
+  font-size: 12px;
+  margin-left: 6px;
+}
 .case-item .case-meta {
   color: var(--muted);
   font-size: 12px;

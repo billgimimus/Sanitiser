@@ -592,10 +592,36 @@ async function listCases(handles, kind) {
     const mapping = await readJSON(rawHandle, '_mapping.json');
     const files = await listFiles(rawHandle, sanHandle, mapping);
     const meta = await tryReadClosure(rawHandle);
-    cases.push({ id: entry.name, kind, rawHandle, sanHandle, files, meta });
+    const clientLabel = deriveClientLabel(mapping);
+    cases.push({ id: entry.name, kind, rawHandle, sanHandle, files, meta, clientLabel });
   }
   cases.sort((a, b) => a.id.localeCompare(b.id));
   return cases;
+}
+
+/**
+ * Once a client name is known for a case (a [CL] or [CL_1] mapping entry
+ * exists) return a short "F.Lastname" label to show next to the case ID
+ * in the sidebar. Purely local rendering - the derived label never
+ * touches the file system or any outbound payload. Returns '' when no
+ * client entry exists yet.
+ */
+function deriveClientLabel(mapping) {
+  const entries = (mapping && mapping.entries) || [];
+  const cl = entries.find((e) => e && (e.token === '[CL]' || e.token === '[CL_1]'))
+    || entries.find((e) => e && /^\[CL_\d+\]$/.test(e.token || ''));
+  if (!cl || !cl.original) return '';
+  const words = String(cl.original).trim().split(/\s+/).filter(Boolean);
+  if (!words.length) return '';
+  // Strip a leading title (Mr / Mrs / Dr etc.) so "Mr Gary Martino"
+  // still yields "G.Martino".
+  const titleRx = new RegExp('^(?:' + PERSON_NAME_TITLES.join('|') + ')\\.?$', 'i');
+  if (words.length > 1 && titleRx.test(words[0])) words.shift();
+  if (!words.length) return '';
+  if (words.length === 1) return words[0];
+  const first = words[0];
+  const last = words[words.length - 1];
+  return `${first[0].toUpperCase()}.${last}`;
 }
 
 async function listFiles(rawHandle, sanHandle, mapping) {
@@ -2773,8 +2799,11 @@ function renderSidebar() {
     const meta = c.meta && c.meta.closureReason
       ? `Closed: ${c.meta.closureReason}`
       : `${c.files.length} file${c.files.length === 1 ? '' : 's'}`;
+    const clientSuffix = c.clientLabel
+      ? ` <span class="case-client" title="Client name (local only - never leaves this machine)">${escapeHtml(c.clientLabel)}</span>`
+      : '';
     item.innerHTML = `
-      <div class="case-id">${escapeHtml(c.id)}</div>
+      <div class="case-id">${escapeHtml(c.id)}${clientSuffix}</div>
       <div class="case-meta">${escapeHtml(meta)}</div>
     `;
     item.addEventListener('click', () => selectCase(c.id));
@@ -4371,6 +4400,10 @@ async function onSanitise() {
     fileEntry.sanitisedName = outputSanitisedName;
     fileEntry.hasSanitised = true;
   }
+  // Update the case's local client label. If the review dialog just
+  // committed a [CL] entry this will populate the sidebar suffix
+  // immediately without a full re-scan.
+  c.clientLabel = deriveClientLabel(mapping);
   const added = accumulateWatchlist(state.watchlist, mapping, c.id);
   if (added) await saveWatchlist(state.handles.root, state.watchlist);
   const verbatimAudit = verbatimIds.length ? `; ${verbatimIds.length} verbatim block(s)` : '';
