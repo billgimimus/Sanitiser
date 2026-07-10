@@ -45,6 +45,14 @@ Built:
 - Binary heuristic fallback for files with unfamiliar extensions: if the first kilobyte contains more than 5% control characters (excluding tab, CR, LF), the file is treated as unsupported.
 - Audit log now records paste-text events with the optional source note.
 
+## Phase 3.2: full-text search, mapping editor with propagation, diff view
+
+The remaining three phase 3 items.
+
+- **Full-text search across sanitised material.** New Search button in the sidebar. Modal with an autofocused input; typing (2+ chars) searches every sanitised file in every case, open and closed. Hits are grouped by file with the query highlighted in three excerpts per file, and each hit has an Open button that jumps you straight to the file. Raw casework is never touched by search.
+- **Mapping editor with token propagation.** Every open case gains a Mapping button that opens an editable table of the case's `_mapping.json` entries: original text, token, category, aliases. Renaming a token also rewrites it across every already-sanitised file in the case so nothing goes stale; longest tokens are propagated first so short prefixes never partially match longer ones (`[CL]` cannot chew up `[CL_1]`). Category and alias edits affect future sanitisations without touching existing output. Deleting an entry removes it from the mapping only; already-sanitised text keeps the token intact.
+- **Diff view.** New Diff tab in the file view. Renders the sanitised text with every token highlighted; hovering a token shows the original identifier it replaced. Unmapped tokens (dashed border, muted colour) stand out so it's obvious which will not rehydrate. Status line names the mapped and unmapped counts.
+
 ## Phase 3.1: OCR, audit log viewer, multi-file clipboard
 
 Three phase 3 features.

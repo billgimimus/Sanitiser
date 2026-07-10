@@ -71,6 +71,7 @@
               </button>
               <button id="btn-paste-rehydrate" class="btn btn-sm" type="button" title="Paste text from an AI response and rehydrate tokens back to real identifiers">Paste rehydrate</button>
               <button id="btn-refresh-cases" class="btn btn-sm" type="button" title="Re-scan the casework folder. Use this after adding case folders or files externally (e.g. via SharePoint sync).">Refresh</button>
+              <button id="btn-search" class="btn btn-sm" type="button" title="Search across every sanitised file in every case (open and closed).">Search</button>
             </div>
           </div>
           <div class="sidebar-tabs" role="tablist">
@@ -115,6 +116,7 @@
           <div class="tabs" role="tablist">
             <button class="tab active" data-tab="original" type="button" role="tab">Original</button>
             <button class="tab" data-tab="sanitised" type="button" role="tab">Sanitised</button>
+            <button class="tab" data-tab="diff" type="button" role="tab" title="Sanitised text with each token annotated with what it replaced.">Diff</button>
           </div>
 
           <div id="stale-warning" class="warning" hidden>
@@ -128,6 +130,10 @@
           <div id="tab-sanitised" class="tab-panel" hidden role="tabpanel">
             <div id="sanitised-status" class="muted"></div>
             <pre id="sanitised-content"></pre>
+          </div>
+          <div id="tab-diff" class="tab-panel" hidden role="tabpanel">
+            <div id="diff-status" class="muted"></div>
+            <pre id="diff-content" style="white-space:pre-wrap;"></pre>
           </div>
         </div>
       </section>

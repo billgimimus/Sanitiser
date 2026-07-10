@@ -2470,6 +2470,8 @@ function init() {
   document.getElementById('btn-paste-rehydrate').addEventListener('click', onPasteRehydrate);
   const refreshBtn = document.getElementById('btn-refresh-cases');
   if (refreshBtn) refreshBtn.addEventListener('click', onRefreshCases);
+  const searchBtn = document.getElementById('btn-search');
+  if (searchBtn) searchBtn.addEventListener('click', onOpenSearch);
   document.querySelectorAll('#sidebar .tab').forEach((btn) => {
     btn.addEventListener('click', () => switchSidebarView(btn.dataset.view));
   });
@@ -2626,6 +2628,11 @@ function renderSidebar() {
         btnAudit.title = 'View the case audit log inside the tool.';
         btnAudit.addEventListener('click', (ev) => { ev.stopPropagation(); onViewAuditLog(c); });
         actions.appendChild(btnAudit);
+        const btnMapping = document.createElement('button');
+        btnMapping.textContent = 'Mapping';
+        btnMapping.title = 'View and edit this case\'s token mapping. Token renames are propagated across every sanitised file.';
+        btnMapping.addEventListener('click', (ev) => { ev.stopPropagation(); onViewMapping(c); });
+        actions.appendChild(btnMapping);
         const btnClose = document.createElement('button');
         btnClose.textContent = 'Close case';
         btnClose.addEventListener('click', (ev) => { ev.stopPropagation(); onCloseCase(c); });
@@ -3175,6 +3182,56 @@ function switchFileTab(which) {
   });
   document.getElementById('tab-original').hidden = which !== 'original';
   document.getElementById('tab-sanitised').hidden = which !== 'sanitised';
+  const diffTab = document.getElementById('tab-diff');
+  if (diffTab) diffTab.hidden = which !== 'diff';
+  if (which === 'diff') renderDiffView();
+}
+
+/**
+ * Render the sanitised text with every token annotated with the
+ * original identifier it replaced. Tokens are wrapped in a <mark> with
+ * a title tooltip so the adviser can hover and see the mapping without
+ * flipping between tabs. Any token not found in the mapping (e.g. the
+ * preserved [DOB] pseudo-token) is highlighted differently so it stands
+ * out as unmapped.
+ */
+function renderDiffView() {
+  const container = document.getElementById('diff-content');
+  const status = document.getElementById('diff-status');
+  if (!container || !status) return;
+  if (!state.currentSanitised) {
+    status.textContent = 'No sanitised copy exists yet. Sanitise this file first to see a diff.';
+    container.innerHTML = '';
+    return;
+  }
+  const mapping = state.currentMapping || { entries: [] };
+  const tokenIndex = new Map();
+  for (const entry of (mapping.entries || [])) {
+    if (entry && entry.token) tokenIndex.set(entry.token, entry.original || '');
+  }
+  const sanitised = state.currentSanitised;
+  const tokenRegex = /\[[A-Z0-9'\/ _\-.]+?\]/g;
+  const parts = [];
+  let last = 0;
+  let m;
+  let mappedCount = 0;
+  let unmappedCount = 0;
+  while ((m = tokenRegex.exec(sanitised)) !== null) {
+    parts.push({ type: 'text', text: sanitised.slice(last, m.index) });
+    const original = tokenIndex.get(m[0]);
+    if (original) { mappedCount++; parts.push({ type: 'token', token: m[0], original }); }
+    else { unmappedCount++; parts.push({ type: 'unmapped', token: m[0] }); }
+    last = m.index + m[0].length;
+  }
+  parts.push({ type: 'text', text: sanitised.slice(last) });
+  container.innerHTML = parts.map((p) => {
+    if (p.type === 'text') return escapeHtml(p.text);
+    if (p.type === 'token') return `<mark title="was: ${escapeHtml(p.original)}" style="background:var(--warning-bg);color:var(--warning-text-strong);padding:0 3px;border-radius:2px;">${escapeHtml(p.token)}</mark>`;
+    return `<mark title="Token not in this case\'s mapping. Preserved as-is; will not rehydrate here." style="background:var(--panel-sunken);color:var(--muted);border:1px dashed var(--border-strong);padding:0 3px;border-radius:2px;">${escapeHtml(p.token)}</mark>`;
+  }).join('');
+  const parts2 = [`${mappedCount} token${mappedCount === 1 ? '' : 's'} mapped to originals (hover to see them)`];
+  if (unmappedCount) parts2.push(`${unmappedCount} unmapped token${unmappedCount === 1 ? '' : 's'} (dashed border) - these will not rehydrate`);
+  status.textContent = parts2.join(', ') + '.';
 }
 
 async function onSanitise() {
@@ -3655,6 +3712,275 @@ async function onRefreshCases() {
  * and writes through to the raw folder, sanitised mirror, mapping,
  * closure log, and watchlist.
  */
+/**
+ * Full-text search across every sanitised file in every case, open or
+ * closed. Only sanitised material is searched; the raw case files are
+ * never touched. Case-insensitive; a hit list shows the case, filename,
+ * up to three excerpt lines per file with the query highlighted, and
+ * an Open button that jumps to the file.
+ */
+async function onOpenSearch() {
+  if (!state.handles) { showToast('Open a casework folder first.', true); return; }
+  const root = document.getElementById('dialog-root');
+  root.innerHTML = '';
+  const backdrop = document.createElement('div');
+  backdrop.className = 'modal-backdrop';
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+  modal.style.width = '820px';
+  backdrop.appendChild(modal);
+  modal.innerHTML = `
+    <div class="modal-header">Search sanitised material</div>
+    <div class="modal-body">
+      <p class="muted">Case-insensitive. Only sanitised files are searched. Raw casework is never touched by search.</p>
+      <div class="form-row">
+        <input id="search-query" type="text" placeholder="Type at least 2 characters..." autofocus spellcheck="false" autocomplete="off">
+      </div>
+      <div id="search-results" class="muted" style="min-height:120px;">Type a query.</div>
+    </div>
+    <div class="modal-footer">
+      <button class="primary" data-action="ok">Close</button>
+    </div>
+  `;
+  root.appendChild(backdrop);
+  const input = modal.querySelector('#search-query');
+  const resultsEl = modal.querySelector('#search-results');
+  let timer = null;
+  input.addEventListener('input', () => {
+    clearTimeout(timer);
+    timer = setTimeout(async () => {
+      const q = input.value.trim();
+      if (q.length < 2) { resultsEl.innerHTML = '<div class="muted">Type at least 2 characters.</div>'; return; }
+      resultsEl.innerHTML = '<div class="muted">Searching...</div>';
+      try {
+        const results = await searchAllSanitised(q);
+        resultsEl.innerHTML = renderSearchResults(q, results);
+        resultsEl.querySelectorAll('[data-action="open-hit"]').forEach((btn) => {
+          btn.addEventListener('click', async () => {
+            const caseId = btn.dataset.case;
+            const name = btn.dataset.name;
+            const kind = btn.dataset.kind;
+            backdrop.remove();
+            if (state.view !== kind) switchSidebarView(kind);
+            await refreshCases();
+            await selectCase(caseId);
+            await selectFile(name);
+          });
+        });
+      } catch (err) {
+        resultsEl.innerHTML = `<div class="error">${escapeHtml(err.message)}</div>`;
+      }
+    }, 200);
+  });
+  modal.addEventListener('click', (ev) => {
+    if (ev.target.dataset && ev.target.dataset.action === 'ok') backdrop.remove();
+  });
+}
+
+async function searchAllSanitised(query) {
+  const q = query.toLowerCase();
+  const results = [];
+  const openCases = await listCases(state.handles, 'open');
+  const closedCases = await listCases(state.handles, 'closed');
+  for (const c of [...openCases, ...closedCases]) {
+    if (!c.sanHandle) continue;
+    for await (const entry of c.sanHandle.values()) {
+      if (entry.kind !== 'file') continue;
+      try {
+        const { text } = await readFileText(c.sanHandle, entry.name);
+        const lc = text.toLowerCase();
+        const positions = [];
+        let idx = 0;
+        while (true) {
+          const p = lc.indexOf(q, idx);
+          if (p === -1) break;
+          positions.push(p);
+          idx = p + q.length;
+          if (positions.length > 20) break;
+        }
+        if (positions.length) {
+          results.push({
+            caseId: c.id,
+            kind: c.kind,
+            name: entry.name,
+            hits: positions.map((p) => ({
+              excerpt: text.slice(Math.max(0, p - 40), Math.min(text.length, p + 80 + q.length)),
+              offset: p,
+            })),
+          });
+        }
+      } catch (_e) { /* skip unreadable */ }
+    }
+  }
+  results.sort((a, b) => (b.hits.length - a.hits.length) || a.caseId.localeCompare(b.caseId));
+  return results;
+}
+
+function renderSearchResults(query, results) {
+  if (!results.length) return '<div class="muted">No matches.</div>';
+  const total = results.reduce((s, r) => s + r.hits.length, 0);
+  const header = `<div style="margin-bottom:8px;font-weight:600;">${total} match${total === 1 ? '' : 'es'} in ${results.length} file${results.length === 1 ? '' : 's'}</div>`;
+  return header + results.map((r) => `
+    <div style="margin-bottom:14px;padding:8px;background:var(--panel-alt);border-radius:4px;">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
+        <strong>${escapeHtml(r.caseId)}</strong>
+        ${r.kind === 'closed' ? '<span class="chip">closed</span>' : ''}
+        <code style="font-size:12px;">${escapeHtml(r.name)}</code>
+        <button data-action="open-hit" data-case="${escapeHtml(r.caseId)}" data-name="${escapeHtml(r.name)}" data-kind="${escapeHtml(r.kind)}" style="margin-left:auto;font-size:11px;padding:2px 8px;">Open</button>
+      </div>
+      ${r.hits.slice(0, 3).map((h) => `<div style="font-family:var(--mono);font-size:12px;margin:2px 0;">...${highlightExcerpt(h.excerpt, query)}...</div>`).join('')}
+      ${r.hits.length > 3 ? `<div class="muted">+ ${r.hits.length - 3} more in this file</div>` : ''}
+    </div>
+  `).join('');
+}
+
+function highlightExcerpt(excerpt, query) {
+  const lc = excerpt.toLowerCase();
+  const q = query.toLowerCase();
+  let out = '';
+  let last = 0;
+  let idx = 0;
+  while (true) {
+    const p = lc.indexOf(q, idx);
+    if (p === -1) break;
+    out += escapeHtml(excerpt.slice(last, p));
+    out += `<mark>${escapeHtml(excerpt.slice(p, p + query.length))}</mark>`;
+    last = p + query.length;
+    idx = last;
+  }
+  out += escapeHtml(excerpt.slice(last));
+  return out;
+}
+
+/**
+ * Mapping editor for a case. Presents every mapping entry as an
+ * editable row. On save, token renames are propagated across every
+ * already-sanitised file in the case so old tokens stop appearing.
+ * Original text, aliases, and category can also be edited; those
+ * changes affect future sanitisations but not existing sanitised output.
+ */
+async function onViewMapping(caseObj) {
+  const mapping = await loadMapping(caseObj.rawHandle, caseObj.id);
+  const originalTokens = mapping.entries.map((e) => e.token);
+  const root = document.getElementById('dialog-root');
+  root.innerHTML = '';
+  const backdrop = document.createElement('div');
+  backdrop.className = 'modal-backdrop';
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+  modal.style.width = '1000px';
+  backdrop.appendChild(modal);
+  const renderBody = () => mapping.entries.map((e, i) => `
+    <tr data-idx="${i}">
+      <td><input data-role="original" type="text" value="${escapeHtml(e.original)}" spellcheck="false" autocomplete="off" style="width:100%;font-family:var(--mono);font-size:12px;"></td>
+      <td><input data-role="token" type="text" value="${escapeHtml(e.token)}" spellcheck="false" autocomplete="off" style="width:100%;font-family:var(--mono);font-size:12px;"></td>
+      <td><span class="entity-category">${escapeHtml(e.category || '')}</span></td>
+      <td><input data-role="aliases" type="text" value="${escapeHtml((e.aliases || []).join(', '))}" spellcheck="false" autocomplete="off" placeholder="comma-separated" style="width:100%;font-family:var(--mono);font-size:12px;"></td>
+      <td><button data-action="delete-entry" data-idx="${i}" class="danger" style="font-size:11px;padding:2px 8px;height:auto;">Delete</button></td>
+    </tr>
+  `).join('');
+  modal.innerHTML = `
+    <div class="modal-header">Mapping: ${escapeHtml(caseObj.id)} (${mapping.entries.length} entr${mapping.entries.length === 1 ? 'y' : 'ies'})</div>
+    <div class="modal-body">
+      <p class="muted">Every real identifier this case has tokenised so far. Edit any cell to change it. Renaming a token also rewrites it across every already-sanitised file in the case, so nothing goes stale. Deleting an entry removes it from the mapping only; already-sanitised text keeps the token intact and will not rehydrate until you undo the deletion.</p>
+      <table class="entity-table">
+        <thead>
+          <tr>
+            <th style="width:28%">Original</th>
+            <th style="width:20%">Token</th>
+            <th style="width:14%">Category</th>
+            <th style="width:26%">Aliases</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="mapping-body">${renderBody()}</tbody>
+      </table>
+    </div>
+    <div class="modal-footer">
+      <button data-action="cancel">Cancel</button>
+      <button class="primary" data-action="save">Save and propagate</button>
+    </div>
+  `;
+  root.appendChild(backdrop);
+  modal.addEventListener('click', async (ev) => {
+    const action = ev.target.dataset && ev.target.dataset.action;
+    if (action === 'cancel') { backdrop.remove(); return; }
+    if (action === 'delete-entry') {
+      const i = Number(ev.target.dataset.idx);
+      const entry = mapping.entries[i];
+      if (!entry) return;
+      if (confirm(`Delete "${entry.original}" -> ${entry.token}?\n\nThe token stays in already-sanitised text but rehydration of that text will leave the token in place because the mapping no longer has it.`)) {
+        mapping.entries.splice(i, 1);
+        originalTokens.splice(i, 1);
+        modal.querySelector('#mapping-body').innerHTML = renderBody();
+      }
+      return;
+    }
+    if (action === 'save') {
+      const rows = modal.querySelectorAll('tr[data-idx]');
+      const tokenChanges = [];
+      rows.forEach((row) => {
+        const i = Number(row.dataset.idx);
+        const e = mapping.entries[i];
+        if (!e) return;
+        const oldToken = originalTokens[i];
+        const newToken = row.querySelector('input[data-role="token"]').value.trim();
+        if (oldToken !== newToken && newToken) {
+          tokenChanges.push({ old: oldToken, new: newToken });
+        }
+        e.original = row.querySelector('input[data-role="original"]').value.trim();
+        e.token = newToken || oldToken;
+        e.aliases = row.querySelector('input[data-role="aliases"]').value.split(',').map((s) => s.trim()).filter(Boolean);
+      });
+      await saveMapping(caseObj.rawHandle, mapping);
+      let propagatedCount = 0;
+      if (tokenChanges.length) {
+        propagatedCount = await propagateTokenChanges(caseObj, tokenChanges);
+      }
+      const auditParts = ['Mapping edited'];
+      if (tokenChanges.length) auditParts.push(`${tokenChanges.length} token rename(s) propagated to ${propagatedCount} sanitised file(s)`);
+      await appendAudit(caseObj.rawHandle, auditParts.join('; '));
+      backdrop.remove();
+      showToast(tokenChanges.length
+        ? `Mapping saved. ${tokenChanges.length} token rename(s) applied across ${propagatedCount} sanitised file(s).`
+        : 'Mapping saved.');
+      if (state.currentMapping && state.selectedCaseId === caseObj.id) {
+        state.currentMapping = mapping;
+        if (state.selectedFile) await selectFile(state.selectedFile);
+      }
+      await refreshCases();
+    }
+  });
+}
+
+/**
+ * Walk the sanitised mirror for a case and replace every occurrence of
+ * each old token with its new token in every file. Returns the number
+ * of files that actually changed. Ordering: longest oldToken first so
+ * shorter tokens do not partially match inside longer ones (e.g. avoid
+ * "[CL]" chewing up "[CL_1]" if both are renamed in the same pass).
+ */
+async function propagateTokenChanges(caseObj, changes) {
+  if (!caseObj.sanHandle || !changes.length) return 0;
+  const ordered = [...changes].sort((a, b) => b.old.length - a.old.length);
+  let count = 0;
+  for await (const entry of caseObj.sanHandle.values()) {
+    if (entry.kind !== 'file') continue;
+    try {
+      const { text } = await readFileText(caseObj.sanHandle, entry.name);
+      let next = text;
+      for (const ch of ordered) {
+        if (ch.old && ch.old !== ch.new) next = next.split(ch.old).join(ch.new);
+      }
+      if (next !== text) {
+        await writeFileText(caseObj.sanHandle, entry.name, next);
+        count++;
+      }
+    } catch (_e) { /* skip */ }
+  }
+  return count;
+}
+
 /**
  * Show the case's audit log (_audit.log) in a scrollable modal so the
  * adviser can inspect what has happened to the case without leaving
