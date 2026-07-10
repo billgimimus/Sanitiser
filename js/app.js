@@ -676,9 +676,10 @@ async function loadGlobalSettings(rootHandle) {
   const existing = await readJSON(rootHandle, SETTINGS_FILENAME);
   if (existing && existing.version === 1) {
     if (!Array.isArray(existing.safeList)) existing.safeList = [];
+    if (typeof existing.nerEnabled !== 'boolean') existing.nerEnabled = false;
     return existing;
   }
-  return { version: 1, safeList: [] };
+  return { version: 1, safeList: [], nerEnabled: false };
 }
 
 async function saveGlobalSettings(rootHandle, settings) {
@@ -749,6 +750,116 @@ function accumulateWatchlist(watchlist, mapping, caseId) {
  * Same-case appearances are suppressed so the banner doesn't count the
  * adviser's own history against them.
  */
+// =====================================================================
+// optional NER (Transformers.js + Xenova/bert-base-NER)
+// =====================================================================
+
+const NER_MODEL_ID = 'Xenova/bert-base-NER';
+
+/**
+ * Load the token-classification pipeline on demand. Vendored WASM lives
+ * under lib/; model files are streamed from huggingface.co the first
+ * time and cached by the browser's Cache API. Subsequent activations
+ * (this session or later) are fast and offline-friendly.
+ */
+async function ensureNerPipeline(onProgress) {
+  if (state.nerPipeline) return state.nerPipeline;
+  if (state.nerLoading) throw new Error('Model already loading. Wait for it to finish.');
+  if (!window.Transformers) throw new Error('Transformers.js not loaded. Check lib/transformers.min.js is in place.');
+  state.nerLoading = true;
+  try {
+    const T = window.Transformers;
+    T.env.backends.onnx.wasm.wasmPaths = 'lib/';
+    T.env.allowLocalModels = false;
+    const pipe = await T.pipeline('token-classification', NER_MODEL_ID, {
+      quantized: true,
+      progress_callback: onProgress,
+    });
+    state.nerPipeline = pipe;
+    return pipe;
+  } finally {
+    state.nerLoading = false;
+  }
+}
+
+/**
+ * Run NER on a text and return spans in the same shape the regex
+ * detectors produce. Chunks text on paragraph boundaries so a long
+ * document stays inside the model's 512-token context. PER labels are
+ * mapped to name_possible; LOC to address_line; ORG is treated as a
+ * name_possible so it flows through the review as a judgement call.
+ */
+async function runNerOnText(text) {
+  const pipe = state.nerPipeline;
+  if (!pipe) return [];
+  const chunks = chunkTextForNer(text, 1500);
+  const out = [];
+  for (const chunk of chunks) {
+    const raw = await pipe(chunk.text, { aggregation_strategy: 'simple' });
+    for (const r of raw) {
+      const category = mapNerLabel(r.entity_group || r.entity);
+      if (!category) continue;
+      const start = chunk.offset + r.start;
+      const end = chunk.offset + r.end;
+      out.push({
+        start,
+        end,
+        text: text.slice(start, end),
+        category,
+        source: 'ner',
+      });
+    }
+  }
+  return out;
+}
+
+function chunkTextForNer(text, maxChars) {
+  const chunks = [];
+  if (text.length <= maxChars) return [{ text, offset: 0 }];
+  const paras = text.split(/(\n\s*\n)/);
+  let buf = '';
+  let offset = 0;
+  let bufOffset = 0;
+  for (const piece of paras) {
+    if (buf.length + piece.length > maxChars && buf) {
+      chunks.push({ text: buf, offset: bufOffset });
+      buf = piece;
+      bufOffset = offset;
+    } else {
+      if (!buf) bufOffset = offset;
+      buf += piece;
+    }
+    offset += piece.length;
+  }
+  if (buf) chunks.push({ text: buf, offset: bufOffset });
+  return chunks;
+}
+
+function mapNerLabel(label) {
+  if (!label) return null;
+  const l = label.replace(/^[BIO]-/, '');
+  if (l === 'PER') return 'name_possible';
+  if (l === 'LOC') return 'address_line';
+  if (l === 'ORG') return 'name_possible';
+  return null;
+}
+
+/**
+ * Merge NER spans into the existing entity list. Regex detectors run
+ * first; NER contributes only spans that do not overlap an existing
+ * detection, so the deterministic detectors always win a tie.
+ */
+function mergeNerSpans(entities, nerSpans) {
+  if (!nerSpans.length) return entities;
+  const sorted = [...entities].sort((a, b) => a.start - b.start);
+  const out = [...entities];
+  for (const s of nerSpans) {
+    const overlaps = sorted.some((e) => Math.max(e.start, s.start) < Math.min(e.end, s.end));
+    if (!overlaps) out.push(s);
+  }
+  return out.sort((a, b) => a.start - b.start);
+}
+
 function crossCheckWatchlist(entities, watchlist, currentCaseId) {
   const byKey = new Map();
   for (const entry of watchlist.entries || []) {
@@ -2113,8 +2224,10 @@ const state = {
   currentSanitisedMtime: null,
   currentOriginalMtime: null,
   currentMapping: null,
-  globalSettings: { version: 1, safeList: [] },
+  globalSettings: { version: 1, safeList: [], nerEnabled: false },
   watchlist: { version: 1, entries: [] },
+  nerPipeline: null,
+  nerLoading: false,
 };
 
 document.addEventListener('DOMContentLoaded', init);
@@ -2135,6 +2248,7 @@ function init() {
   document.getElementById('btn-copy-sanitised').addEventListener('click', onCopySanitised);
   document.getElementById('btn-resanitise').addEventListener('click', onSanitise);
   document.getElementById('btn-delete-file').addEventListener('click', onDeleteOpenFile);
+  document.getElementById('ner-toggle').addEventListener('change', onNerToggleChange);
   document.querySelectorAll('#file-view .tabs .tab').forEach((btn) => {
     btn.addEventListener('click', () => switchFileTab(btn.dataset.tab));
   });
@@ -2146,6 +2260,9 @@ async function onOpenRoot() {
     state.globalSettings = await loadGlobalSettings(state.handles.root);
     state.watchlist = await loadWatchlist(state.handles.root);
     document.getElementById('root-path').textContent = 'Casework folder ready';
+    const toggle = document.getElementById('ner-toggle');
+    toggle.checked = !!state.globalSettings.nerEnabled;
+    updateNerStatus();
     await refreshCases();
   } catch (err) {
     if (err && err.name === 'AbortError') return;
@@ -2686,7 +2803,20 @@ async function onSanitise() {
   const mapping = state.currentMapping;
   const safeSet = buildSafeSet(mapping.safeList, state.globalSettings.safeList);
   const rawEntities = detectEntities(state.currentText, mapping, safeSet);
-  const entities = crossCheckWatchlist(rawEntities, state.watchlist, c.id);
+  let mergedEntities = rawEntities;
+  if (state.globalSettings.nerEnabled && state.nerPipeline) {
+    try {
+      updateNerStatus('running');
+      const nerSpans = (await runNerOnText(state.currentText))
+        .filter((s) => !safeSet.has((s.text || '').toLowerCase().trim()));
+      mergedEntities = mergeNerSpans(rawEntities, nerSpans);
+      updateNerStatus('ready');
+    } catch (err) {
+      updateNerStatus('ready');
+      showToast(`NER run failed, continuing with regex only: ${err.message}`, true);
+    }
+  }
+  const entities = crossCheckWatchlist(mergedEntities, state.watchlist, c.id);
   const priorSummary = summarisePriorAppearances(entities);
   const result = await openReviewDialog(entities, mapping, {
     title: state.selectedFile,
@@ -3082,6 +3212,58 @@ async function onDeleteFile(caseObj, name) {
   } catch (err) {
     showToast(`Could not delete: ${err.message}`, true);
   }
+}
+
+/**
+ * Enhanced-detection toggle. First activation warns about the ~50 MB
+ * model download, loads the pipeline, and persists the state. Turning
+ * off keeps the loaded pipeline in memory so re-enabling is instant.
+ */
+async function onNerToggleChange(ev) {
+  const enable = !!ev.target.checked;
+  if (!state.handles) {
+    showToast('Open a casework folder first so the setting can be saved.', true);
+    ev.target.checked = false;
+    return;
+  }
+  if (enable) {
+    if (!state.nerPipeline) {
+      const ok = confirm(
+        'Turning on enhanced detection downloads a ~50 MB named-entity model from huggingface.co on first use. Subsequent uses are offline. Proceed?'
+      );
+      if (!ok) {
+        ev.target.checked = false;
+        return;
+      }
+      try {
+        updateNerStatus('loading');
+        await ensureNerPipeline((event) => {
+          if (event && event.status === 'progress' && event.file) {
+            updateNerStatus(`downloading ${event.file.split('/').pop()} ${Math.round(event.progress || 0)}%`);
+          }
+        });
+        updateNerStatus('ready');
+      } catch (err) {
+        showToast(`Could not load NER model: ${err.message}`, true);
+        ev.target.checked = false;
+        updateNerStatus();
+        return;
+      }
+    } else {
+      updateNerStatus('ready');
+    }
+  } else {
+    updateNerStatus();
+  }
+  state.globalSettings.nerEnabled = enable;
+  await saveGlobalSettings(state.handles.root, state.globalSettings);
+}
+
+function updateNerStatus(label) {
+  const el = document.getElementById('ner-status');
+  if (!el) return;
+  if (!label) { el.textContent = ''; return; }
+  el.textContent = `(${label})`;
 }
 
 async function onDeleteOpenFile() {

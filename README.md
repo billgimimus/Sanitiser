@@ -19,6 +19,23 @@ If the page shows a red banner saying the tool did not start, one of two things 
 3. Drag one or more files onto the case row in the sidebar to add them to the case.
 4. Click a file to open it. The Original tab shows the raw text; the Sanitised tab shows the tokenised copy once you sanitise it.
 
+## Enhanced detection (optional)
+
+The regex layer covers roughly 70% of identifiers by design. To improve name coverage, especially non-Western names (Polish, Somali, Roma, Arabic, Ukrainian, Bengali surnames) that the regex heuristics struggle with, the tool ships an optional named-entity recognition layer using a BERT-based model.
+
+- Off by default. The toggle in the top toolbar labelled **Enhanced detection (NER)** turns it on per casework folder.
+- First activation downloads the model (about 50 MB) from `huggingface.co`. This is the only network call the tool ever makes from the running app. The download is cached by the browser; subsequent activations are offline.
+- When enabled, sanitisation runs the NER model in addition to the regex detectors. Detected persons and organisations flow into the review dialog as `name_possible`; locations flow in as `address_line`. Regex detections always win when a span overlaps.
+- The toggle state is persisted in `_settings.json` at the casework root.
+
+If loading the model fails (network blocked, WASM not found), the toast points at the underlying error and the toggle stays off. The tool continues to work with regex-only detection.
+
+Files to copy across when adopting NER:
+
+- `lib/transformers.min.js`
+- `lib/ort-wasm-simd.wasm`
+- `lib/transformers.LICENSE`
+
 ## Deleting a file
 
 Hover over a file in the sidebar to reveal a small × on the right. Clicking it prompts for confirmation, then removes the raw file and, if there is one, the sanitised mirror. The open file view also has a **Delete file** button styled in red. The case mapping is left intact so tokens already used elsewhere in the case still resolve.

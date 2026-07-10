@@ -14,6 +14,11 @@
       <div class="topbar-actions">
         <button id="btn-open-root" class="primary" type="button">Open casework folder</button>
         <span id="root-path" class="muted"></span>
+        <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;" title="Uses a local machine-learning model to improve detection of names the regex layer misses (especially non-Western names). First activation downloads about 50 MB from huggingface.co.">
+          <input id="ner-toggle" type="checkbox">
+          <span class="muted">Enhanced detection (NER)</span>
+        </label>
+        <span id="ner-status" class="muted"></span>
         <span id="clipboard-indicator" class="muted" aria-live="polite"></span>
       </div>
     </header>
@@ -98,6 +103,7 @@
   </script>
   <script src="lib/msgreader.min.js"></script>
   <script src="lib/pdf.min.js"></script>
+  <script src="lib/transformers.min.js"></script>
   <script src="js/app.js"></script>
 </body>
 </html>

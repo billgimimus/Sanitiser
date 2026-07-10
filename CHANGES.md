@@ -45,6 +45,26 @@ Built:
 - Binary heuristic fallback for files with unfamiliar extensions: if the first kilobyte contains more than 5% control characters (excluding tab, CR, LF), the file is treated as unsupported.
 - Audit log now records paste-text events with the optional source note.
 
+## Phase 2.6: Optional NER (Xenova/bert-base-NER)
+
+Add opt-in named-entity recognition using Transformers.js + Xenova/bert-base-NER. Off by default; toggle in the top toolbar labelled "Enhanced detection (NER)". First activation warns about the ~50 MB model download from huggingface.co, loads the pipeline, and persists `nerEnabled: true` in `_settings.json`. Subsequent activations are offline (cached by the browser's Cache API).
+
+- Vendored `lib/transformers.min.js` (785 KB, rebundled from `@xenova/transformers@2.17.2` as an IIFE via esbuild so it loads under `file://`).
+- Vendored `lib/ort-wasm-simd.wasm` (10 MB, the ONNX Runtime SIMD build used by the ONNX backend).
+- When enabled, sanitisation runs both the regex layer and NER. Regex spans always win where an NER span overlaps, so deterministic detection is not weakened. NER labels are mapped: PER → name_possible, LOC → address_line, ORG → name_possible. MISC is dropped.
+- Text is chunked on paragraph boundaries with a rough 1500-character budget per chunk so long documents stay inside BERT's 512-token context.
+- The pipeline is loaded once per session and reused; toggling off keeps it in memory so re-enabling is instant.
+- Safe-list matches suppress NER-emitted spans just as they do regex spans.
+- If loading or running the model fails, a toast shows the error and the tool continues with regex-only.
+
+Files to copy across when updating a laptop and adopting NER:
+
+- `js/app.js`
+- `index.html`
+- `lib/transformers.min.js` (new)
+- `lib/ort-wasm-simd.wasm` (new)
+- `lib/transformers.LICENSE` (new)
+
 ## Phase 2.5: PDF text extraction
 
 Add vendored `lib/pdf.min.js` (320 KB) and `lib/pdf.worker.min.js` (1.06 MB) from `pdfjs-dist@3.11.174` (Apache 2.0). Drop handler routes `.pdf` files through PDF.js: text content per page is extracted, glued into visual lines by position, and saved as `<basename>.txt` inside the case with a header naming the page count. Pages that produce no text (scanned image PDFs) are recorded as warnings; if every page is empty, an additional line notes that OCR is out of scope.
