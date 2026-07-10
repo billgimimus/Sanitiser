@@ -3829,8 +3829,31 @@ function installFloatingTokeniseButton() {
   document.addEventListener('mouseup', () => {
     setTimeout(handleSelectionForFloating, 0);
   });
+  // selectionchange fires whenever the caret or selection changes for
+  // any reason (mouse, keyboard, script). Without this the button hangs
+  // around after the highlight is cleared by anything other than a
+  // fresh mouseup.
+  document.addEventListener('selectionchange', () => {
+    const sel = window.getSelection();
+    const text = sel ? sel.toString().trim() : '';
+    if (!text || text.length < 2) hideFloatingTokBtn();
+  });
   document.addEventListener('keyup', (ev) => {
     if (ev.key === 'Escape') hideFloatingTokBtn();
+  });
+  // A click on anything that isn't the floating button itself should
+  // clear it - covers clicks on other buttons that don't fire a fresh
+  // text mouseup.
+  document.addEventListener('mousedown', (ev) => {
+    if (floatingTokBtn && !floatingTokBtn.hidden && ev.target !== floatingTokBtn) {
+      // Give the mouseup/selectionchange path a tick to update the
+      // selection first; only hide if the selection was actually cleared.
+      setTimeout(() => {
+        const sel = window.getSelection();
+        const text = sel ? sel.toString().trim() : '';
+        if (!text || text.length < 2) hideFloatingTokBtn();
+      }, 0);
+    }
   });
   window.addEventListener('scroll', hideFloatingTokBtn, true);
 }
