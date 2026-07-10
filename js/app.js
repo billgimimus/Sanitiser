@@ -278,6 +278,15 @@ const NAME_TITLES = /\b(?:Mr|Mrs|Ms|Miss|Mx|Dr)\.?\s+[A-Z][a-z]+(?:[- ][A-Z][a-z
 const NAME_PLAIN = /\b[A-Z][a-z]+(?:[- ][A-Z][a-z]+)+\b/g;
 
 /**
+ * Salutation followed by a capitalised name. Written as a separate
+ * pattern so single-word given names ("Hi Kieran,") are still caught
+ * even though the multi-word NAME_PLAIN detector would not see them.
+ * Longer alternatives ("Kind regards") come first so they win over
+ * their shorter prefixes.
+ */
+const SALUTATION_NAME = /\b(?:Kind\s+regards|Kindest\s+regards|Best\s+regards|Best\s+wishes|Warmest\s+regards|Thank\s+you|Many\s+thanks|Hi|Hello|Hey|Cheers|Best|Thanks|Dear|Yours|Regards|Warmest|Warm|Attn|FAO|Sincerely|Faithfully)[,;:.]?\s+([A-Z][a-z]+(?:[- ][A-Z][a-z]+)*)/g;
+
+/**
  * Full address line: house number followed by street name, up to a comma
  * or newline. Used mainly for the address_line category flag.
  */
@@ -320,6 +329,25 @@ const DETECTORS = [
   { name: 'date_named', run: (t) => matchesOf(t, DATE_NAMED, 'date') },
   { name: 'address_line', run: (t) => matchesOf(t, ADDRESS_LINE, 'address_line') },
   { name: 'name_titled', run: (t) => matchesOf(t, NAME_TITLES, 'name_possible') },
+  {
+    name: 'salutation_name',
+    run(text) {
+      const out = [];
+      for (const m of text.matchAll(SALUTATION_NAME)) {
+        const captured = m[1];
+        const first = captured.split(/[- ]/)[0];
+        if (NAME_STOPWORDS.has(first)) continue;
+        const nameStart = m.index + m[0].length - captured.length;
+        out.push({
+          start: nameStart,
+          end: nameStart + captured.length,
+          text: captured,
+          category: 'name_possible',
+        });
+      }
+      return out;
+    },
+  },
   {
     name: 'name_plain',
     run(text) {
