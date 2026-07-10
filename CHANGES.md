@@ -45,6 +45,24 @@ Built:
 - Binary heuristic fallback for files with unfamiliar extensions: if the first kilobyte contains more than 5% control characters (excluding tab, CR, LF), the file is treated as unsupported.
 - Audit log now records paste-text events with the optional source note.
 
+## Phase 2.1: .eml drag-drop with inline parser
+
+First feature of phase 2. Drop one or more `.eml` files onto a case row and the tool now:
+
+- Parses the file as MIME text: headers with continuation, RFC 2047 encoded-word subjects, multipart / multipart-alternative bodies, nested multipart, quoted-printable and base64 transfer encodings.
+- Prefers `text/plain` in a multipart/alternative body; falls back to a minimal HTML → text conversion when only HTML is available.
+- Extracts attachment metadata (filename, content type, approximate size) and records each attachment in the saved text file as "present, not processed by the tool". Attachment binaries are not yet extracted; PDF and image support arrive later in phase 2.
+- Saves the parsed content as `<basename>.txt` inside the case's raw folder, with a stable, readable header block. If the destination name already exists, a numeric suffix is added.
+- Shows a summary modal after the drop listing each imported email, its attachments, and any parser warnings.
+- Records the import in the case audit log.
+- Falls back to a raw `.eml` copy if parsing fails, so real emails are never lost.
+
+Deliberate limits at this stage:
+
+- No Outlook `.msg` support yet (compound binary, needs vendored `msgreader`). The paste-text failsafe covers this in the meantime.
+- Character sets other than UTF-8 decode as UTF-8. This is fine for casework English but would garble non-UTF-8 accents.
+- Nested multipart with attachments deep inside is handled, but complex threading (In-Reply-To / References chains across many messages) is not consolidated across files; each `.eml` is imported independently.
+
 ## Phase 1.3: delete file
 
 - Every file in the sidebar shows a small × on hover. Clicking it prompts for confirmation, then removes the raw copy and the sanitised mirror if one exists.

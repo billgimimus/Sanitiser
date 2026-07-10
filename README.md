@@ -23,9 +23,19 @@ If the page shows a red banner saying the tool did not start, one of two things 
 
 Hover over a file in the sidebar to reveal a small × on the right. Clicking it prompts for confirmation, then removes the raw file and, if there is one, the sanitised mirror. The open file view also has a **Delete file** button styled in red. The case mapping is left intact so tokens already used elsewhere in the case still resolve.
 
-## Emails, PDFs, and other formats the tool cannot yet parse
+## Emails
 
-Phase 1 only handles plain-text files (`.txt`, `.md`, and other UTF-8 readable content). Outlook `.msg` files, PDFs, `.docx`, and images are added in phase 2. For now, when you open a file the tool cannot read, you get a clear message rather than garbled bytes.
+Drop one or more `.eml` files onto a case in the sidebar and the tool parses them and saves each as a plain-text file inside the case, named after the source (`meeting.eml` becomes `meeting.txt`). If a file with that name already exists, a suffix is added.
+
+The saved text contains a readable header block (From, To, Cc, Subject, Date, Message-ID, In-Reply-To), the body text, and a section listing any attachments. Attachment content is not yet extracted (that arrives with PDF and image support later in phase 2), so the tool records each one as "present, not processed by the tool" so nothing is silently dropped and the names still surface in the sanitisation review.
+
+A summary modal opens after import listing attachments and any parser warnings. If parsing fails, the raw `.eml` is saved unchanged and the paste-text failsafe stays available.
+
+Outlook `.msg` files are still binary and need vendored `msgreader` support, which will follow in a second commit. For those, use the paste-text failsafe: right-click the email in Outlook, choose "Save as", pick `.txt`, drop it in.
+
+## Formats the tool cannot yet parse
+
+Phase 1 handles plain-text files (`.txt`, `.md`, and other UTF-8 readable content) directly, plus `.eml` via the parser above. Outlook `.msg`, PDFs, `.docx`, and images arrive in the rest of phase 2. When you open a file the tool cannot read, you get a clear message rather than garbled bytes.
 
 **The failsafe** is a per-case button labelled **Paste text as new file**. Open the source in its native viewer (Outlook, a PDF reader, whatever), copy the text you want to send to Claude, and paste it into the modal. The tool saves it as a `.txt` inside the case folder, records the paste in the case audit log, and opens it ready to sanitise. The rest of the workflow, including the mapping and the reverse integrity check, is identical.
 

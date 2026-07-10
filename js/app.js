@@ -1111,6 +1111,234 @@ function buildLiteralRegex(str) {
 
 
 // =====================================================================
+// eml-parser: minimal MIME parser for .eml drag-drop
+// =====================================================================
+
+/**
+ * Parse an .eml file into a normalized shape:
+ *   { headers, bodyText, attachments, warnings }
+ *
+ * Handles: RFC 2822 headers with continuation, RFC 2047 encoded-word
+ * subject fields, multipart/* including nested, multipart/alternative
+ * (prefers text/plain), quoted-printable and base64 transfer encoding,
+ * and a minimal HTML-to-text fallback for HTML-only bodies.
+ *
+ * Intentional limits: single-byte and UTF-8 only; complex character sets
+ * beyond that decode as UTF-8, which is fine for casework English but
+ * would garble e.g. Windows-1252 accents. If a real email fails to
+ * parse cleanly, drop the raw .eml and use the paste-text failsafe.
+ */
+function parseEml(raw) {
+  const norm = String(raw).replace(/\r\n/g, '\n');
+  const sepIdx = norm.indexOf('\n\n');
+  if (sepIdx === -1) {
+    return { headers: [], bodyText: norm, attachments: [], warnings: ['No header/body separator; treating as body only.'] };
+  }
+  const headers = emlParseHeaders(norm.slice(0, sepIdx));
+  const body = norm.slice(sepIdx + 2);
+  const attachments = [];
+  const warnings = [];
+  const bodyText = emlExtractBody({ headers, body, attachments, warnings });
+  return { headers, bodyText, attachments, warnings };
+}
+
+function emlParseHeaders(block) {
+  const out = [];
+  const lines = block.split('\n');
+  let current = null;
+  for (const line of lines) {
+    if (/^[ \t]/.test(line) && current) {
+      current.value += '\n' + line.replace(/^[ \t]+/, ' ');
+      continue;
+    }
+    const idx = line.indexOf(':');
+    if (idx === -1) continue;
+    if (current) out.push(current);
+    current = { name: line.slice(0, idx).trim(), value: line.slice(idx + 1).trim() };
+  }
+  if (current) out.push(current);
+  return out;
+}
+
+function emlHeaderValue(headers, name) {
+  const lc = name.toLowerCase();
+  for (const h of headers) if (h.name.toLowerCase() === lc) return h.value;
+  return null;
+}
+
+function emlExtractParam(headerValueStr, paramName) {
+  if (!headerValueStr) return null;
+  const rx = new RegExp(`;\\s*${paramName}\\s*=\\s*(?:"([^"]*)"|([^;\\s]+))`, 'i');
+  const m = headerValueStr.match(rx);
+  if (!m) return null;
+  return m[1] || m[2];
+}
+
+function emlExtractBody(ctx) {
+  const ct = emlHeaderValue(ctx.headers, 'content-type') || 'text/plain';
+  const cte = (emlHeaderValue(ctx.headers, 'content-transfer-encoding') || '').toLowerCase();
+  const charset = emlExtractParam(ct, 'charset') || 'utf-8';
+  if (/^multipart\//i.test(ct)) {
+    const boundary = emlExtractParam(ct, 'boundary');
+    if (!boundary) {
+      ctx.warnings.push('Multipart Content-Type without boundary; treating body as raw.');
+      return ctx.body;
+    }
+    return emlExtractMultipart(ct, ctx.body, boundary, ctx.attachments, ctx.warnings);
+  }
+  if (/^text\/html/i.test(ct)) return emlHtmlToText(emlDecodeContent(ctx.body, cte, charset));
+  return emlDecodeContent(ctx.body, cte, charset);
+}
+
+function emlExtractMultipart(parentCt, body, boundary, attachments, warnings) {
+  const parts = emlSplitMultipart(body, boundary);
+  const isAlternative = /multipart\/alternative/i.test(parentCt);
+  const textPieces = [];
+  const htmlPieces = [];
+  for (const p of parts) {
+    const ph = emlParseHeaders(p.headerBlock);
+    const pct = emlHeaderValue(ph, 'content-type') || 'text/plain';
+    const pcte = (emlHeaderValue(ph, 'content-transfer-encoding') || '').toLowerCase();
+    const pcd = emlHeaderValue(ph, 'content-disposition') || '';
+    const charset = emlExtractParam(pct, 'charset') || 'utf-8';
+    const filename = emlExtractParam(pcd, 'filename') || emlExtractParam(pct, 'name');
+    const isAttachment = /^attachment/i.test(pcd)
+      || (filename && !/^inline/i.test(pcd) && !/^text\//i.test(pct));
+    if (isAttachment) {
+      attachments.push({
+        filename: filename || '(unnamed)',
+        contentType: pct.split(';')[0].trim(),
+        approxSize: Math.round(p.body.length * (pcte === 'base64' ? 0.75 : 1)),
+      });
+      continue;
+    }
+    if (/^multipart\//i.test(pct)) {
+      const innerBoundary = emlExtractParam(pct, 'boundary');
+      if (innerBoundary) {
+        textPieces.push(emlExtractMultipart(pct, p.body, innerBoundary, attachments, warnings));
+      }
+      continue;
+    }
+    if (/^text\/plain/i.test(pct)) textPieces.push(emlDecodeContent(p.body, pcte, charset));
+    else if (/^text\/html/i.test(pct)) htmlPieces.push(emlHtmlToText(emlDecodeContent(p.body, pcte, charset)));
+  }
+  if (isAlternative) return textPieces[0] || htmlPieces[0] || '';
+  return [...textPieces, ...htmlPieces].filter(Boolean).join('\n');
+}
+
+function emlSplitMultipart(body, boundary) {
+  const marker = '--' + boundary;
+  const parts = [];
+  let cursor = 0;
+  while (true) {
+    const start = body.indexOf(marker, cursor);
+    if (start === -1) break;
+    const afterMarker = start + marker.length;
+    if (body.slice(afterMarker, afterMarker + 2) === '--') break;
+    const partBodyStart = afterMarker;
+    const nextStart = body.indexOf('\n' + marker, partBodyStart);
+    const partEnd = nextStart === -1 ? body.length : nextStart + 1;
+    const partSlice = body.slice(partBodyStart, partEnd).replace(/^\n/, '').replace(/\n$/, '');
+    const sepIdx = partSlice.indexOf('\n\n');
+    if (sepIdx === -1) parts.push({ headerBlock: partSlice, body: '' });
+    else parts.push({ headerBlock: partSlice.slice(0, sepIdx), body: partSlice.slice(sepIdx + 2) });
+    cursor = partEnd;
+  }
+  return parts;
+}
+
+function emlDecodeContent(body, cte, _charset) {
+  if (cte === 'base64') { try { return emlDecodeBase64Utf8(body.replace(/[\r\n]/g, '')); } catch (_e) { return body; } }
+  if (cte === 'quoted-printable') return emlDecodeQuotedPrintable(body);
+  return body;
+}
+
+function emlDecodeQuotedPrintable(input) {
+  const withoutSoft = input.replace(/=\r?\n/g, '');
+  const bytes = [];
+  for (let i = 0; i < withoutSoft.length; i++) {
+    const c = withoutSoft.charCodeAt(i);
+    if (c === 61 && i + 2 < withoutSoft.length) {
+      const hex = withoutSoft.slice(i + 1, i + 3);
+      if (/^[0-9A-Fa-f]{2}$/.test(hex)) { bytes.push(parseInt(hex, 16)); i += 2; continue; }
+    }
+    bytes.push(c);
+  }
+  return new TextDecoder('utf-8').decode(new Uint8Array(bytes));
+}
+
+function emlDecodeBase64Utf8(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder('utf-8').decode(bytes);
+}
+
+function emlDecodeMimeWords(str) {
+  if (!str) return str;
+  return str.replace(/=\?([^?]+)\?([BQ])\?([^?]*)\?=/gi, (_m, _cs, enc, text) => {
+    try {
+      if (enc.toUpperCase() === 'B') return emlDecodeBase64Utf8(text);
+      return emlDecodeQuotedPrintable(text.replace(/_/g, ' '));
+    } catch (_e) { return _m; }
+  });
+}
+
+function emlHtmlToText(html) {
+  return String(html)
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<\/li>/gi, '\n')
+    .replace(/<\/tr>/gi, '\n')
+    .replace(/<\/?[a-z][^>]*>/gi, '')
+    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
+    .replace(/\n{3,}/g, '\n\n').trim();
+}
+
+/**
+ * Render a parsed .eml as the plain-text file the tool actually saves
+ * into the case. Header block is deliberately readable and stable; the
+ * sanitiser then treats it as any other document.
+ */
+function formatEmlAsText(parsed, sourceFilename) {
+  const wanted = ['from', 'to', 'cc', 'bcc', 'subject', 'date', 'message-id', 'in-reply-to'];
+  const lines = [`# Imported from email: ${sourceFilename}`, ''];
+  for (const name of wanted) {
+    const raw = emlHeaderValue(parsed.headers, name);
+    if (!raw) continue;
+    const value = emlDecodeMimeWords(raw).replace(/\n\s*/g, ' ');
+    lines.push(`${headerLabel(name)}: ${value}`);
+  }
+  lines.push('', '---', '', parsed.bodyText.trim() || '(empty body)');
+  if (parsed.attachments.length) {
+    lines.push('', '---', '', 'Attachments (present, not processed by the tool):');
+    for (const a of parsed.attachments) {
+      lines.push(`  - ${a.filename} (${a.contentType}, approx ${humanBytes(a.approxSize)})`);
+    }
+  }
+  if (parsed.warnings.length) {
+    lines.push('', '---', '', 'Parser warnings:');
+    for (const w of parsed.warnings) lines.push(`  - ${w}`);
+  }
+  return lines.join('\n') + '\n';
+}
+
+function headerLabel(name) {
+  const map = { from: 'From', to: 'To', cc: 'Cc', bcc: 'Bcc', subject: 'Subject', date: 'Date', 'message-id': 'Message-ID', 'in-reply-to': 'In-Reply-To' };
+  return map[name] || name;
+}
+
+function humanBytes(n) {
+  if (n < 1024) return `${n} bytes`;
+  if (n < 1024 * 1024) return `${Math.round(n / 102.4) / 10} KB`;
+  return `${Math.round(n / (1024 * 1024) * 10) / 10} MB`;
+}
+
+
+// =====================================================================
 // js/case-manager.js
 // =====================================================================
 
@@ -1817,18 +2045,131 @@ function configureCaseDrop(caseItem, container, caseObj) {
       el.style.background = '';
       const files = Array.from(ev.dataTransfer.files);
       if (!files.length) return;
+      const importedNames = [];
+      const emlSummaries = [];
       for (const f of files) {
-        const buf = await f.arrayBuffer();
-        const h = await caseObj.rawHandle.getFileHandle(f.name, { create: true });
-        const w = await h.createWritable();
-        await w.write(buf);
-        await w.close();
+        const savedName = await handleDroppedFile(caseObj, f, emlSummaries);
+        importedNames.push(savedName);
       }
-      await appendAudit(caseObj.rawHandle, `${files.length} file(s) added: ${files.map((f) => f.name).join(', ')}`);
+      await appendAudit(caseObj.rawHandle, `${files.length} file(s) added: ${importedNames.join(', ')}`);
       await refreshCases();
-      showToast(`${files.length} file${files.length === 1 ? '' : 's'} added.`);
+      if (emlSummaries.length) {
+        showEmailImportSummary(emlSummaries);
+      } else {
+        showToast(`${files.length} file${files.length === 1 ? '' : 's'} added.`);
+      }
     });
   }
+}
+
+/**
+ * Route a dropped file through parser-specific handling if we recognise
+ * the format, otherwise fall back to a raw byte-for-byte copy. Returns
+ * the filename that was actually saved into the case, so the audit log
+ * reflects the on-disk state.
+ */
+async function handleDroppedFile(caseObj, file, emlSummaries) {
+  const lower = file.name.toLowerCase();
+  if (lower.endsWith('.eml')) {
+    try {
+      const raw = await readFileAsUtf8(file);
+      const parsed = parseEml(raw);
+      const text = formatEmlAsText(parsed, file.name);
+      const savedName = await writeUnique(caseObj.rawHandle, replaceExtension(file.name, '.txt'), text);
+      emlSummaries.push({
+        sourceName: file.name,
+        savedName,
+        attachments: parsed.attachments,
+        warnings: parsed.warnings,
+      });
+      return savedName;
+    } catch (err) {
+      const buf = await file.arrayBuffer();
+      const savedName = await writeRawUnique(caseObj.rawHandle, file.name, buf);
+      showToast(`Could not parse ${file.name} as email (${err.message}); saved raw instead. Use "Paste text as new file" for the content you want to sanitise.`, true);
+      return savedName;
+    }
+  }
+  const buf = await file.arrayBuffer();
+  return writeRawUnique(caseObj.rawHandle, file.name, buf);
+}
+
+async function readFileAsUtf8(file) {
+  const buf = await file.arrayBuffer();
+  return new TextDecoder('utf-8').decode(new Uint8Array(buf));
+}
+
+function replaceExtension(name, newExt) {
+  const dot = name.lastIndexOf('.');
+  if (dot <= 0) return name + newExt;
+  return name.slice(0, dot) + newExt;
+}
+
+async function writeUnique(dirHandle, name, text) {
+  const unique = await ensureUniqueName(dirHandle, name);
+  await writeFileText(dirHandle, unique, text);
+  return unique;
+}
+
+async function writeRawUnique(dirHandle, name, buf) {
+  const unique = await ensureUniqueName(dirHandle, name);
+  const h = await dirHandle.getFileHandle(unique, { create: true });
+  const w = await h.createWritable();
+  await w.write(buf);
+  await w.close();
+  return unique;
+}
+
+async function ensureUniqueName(dirHandle, name) {
+  const exists = async (n) => {
+    try { await dirHandle.getFileHandle(n); return true; } catch (_e) { return false; }
+  };
+  if (!(await exists(name))) return name;
+  const dot = name.lastIndexOf('.');
+  const base = dot > 0 ? name.slice(0, dot) : name;
+  const ext = dot > 0 ? name.slice(dot) : '';
+  for (let i = 2; i < 500; i++) {
+    const candidate = `${base}_${i}${ext}`;
+    if (!(await exists(candidate))) return candidate;
+  }
+  return `${base}_${Date.now()}${ext}`;
+}
+
+function showEmailImportSummary(summaries) {
+  const root = document.getElementById('dialog-root');
+  root.innerHTML = '';
+  const backdrop = document.createElement('div');
+  backdrop.className = 'modal-backdrop';
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+  modal.style.width = '620px';
+  backdrop.appendChild(modal);
+  const rows = summaries.map((s) => `
+    <div style="margin-bottom:12px;padding:8px;background:#f4f2ec;border-radius:4px;">
+      <div><strong>${escapeHtml(s.sourceName)}</strong> imported as <code>${escapeHtml(s.savedName)}</code></div>
+      ${s.attachments.length ? `
+        <div style="margin-top:4px;font-size:12px;">Attachments (recorded in the text file as present, not processed):</div>
+        <ul style="margin:2px 0 0 20px;font-size:12px;">
+          ${s.attachments.map((a) => `<li>${escapeHtml(a.filename)} <span class="muted">(${escapeHtml(a.contentType)}, ~${escapeHtml(humanBytes(a.approxSize))})</span></li>`).join('')}
+        </ul>` : '<div class="muted" style="font-size:12px;">No attachments detected.</div>'}
+      ${s.warnings.length ? `
+        <div style="margin-top:4px;font-size:12px;color:var(--warning-text);">Warnings: ${s.warnings.map(escapeHtml).join('; ')}</div>` : ''}
+    </div>
+  `).join('');
+  modal.innerHTML = `
+    <div class="modal-header">Email import summary</div>
+    <div class="modal-body">
+      <p class="muted">Attachment content is not yet extracted by the tool. The imported text file lists them so nothing is silently dropped, and their names still appear in the sanitisation review. When PDF and image support arrives in phase 2, previously skipped attachments can be processed from the case view.</p>
+      ${rows}
+    </div>
+    <div class="modal-footer">
+      <button class="primary" data-action="ok">Done</button>
+    </div>
+  `;
+  modal.addEventListener('click', (ev) => {
+    if (ev.target.dataset && ev.target.dataset.action === 'ok') backdrop.remove();
+  });
+  root.appendChild(backdrop);
 }
 
 async function selectCase(id) {
