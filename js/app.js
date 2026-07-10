@@ -183,6 +183,55 @@ const SAFE_IDENTITIES = new Set([
 ]);
 
 /**
+ * Roles whose value is a person's name. When a mapping entry uses one of
+ * these tokens the sanitiser seeds standard name variations (initials,
+ * titles, first-name-only, etc.) as aliases so shorthand references get
+ * caught alongside the full form.
+ *
+ * Roles that hold contact details, org names or venue names are excluded.
+ */
+const PERSON_NAME_ROLES = new Set([
+  '[CL]',
+  "[CL'S PARTNER]",
+  "[CL'S EX-PARTNER]",
+  "[CL'S CHILD]",
+  "[CL'S PARENT]",
+  "[CL'S SIBLING]",
+  "[CL'S SUPPORT WORKER]",
+  "[CL'S SOLICITOR]",
+  "[CL'S GP]",
+  "[CL'S MH PRACTITIONER]",
+  '[LANDLORD]',
+  "[LANDLORD'S AGENT]",
+  "[LANDLORD'S SOLICITOR]",
+  '[LA HOUSING OFFICER]',
+  '[LA HOMELESSNESS OFFICER]',
+  '[LA REVIEWS OFFICER]',
+  '[LA HB/UC DECISION MAKER]',
+  '[SM]',
+  '[SUPPORT WORKER]',
+  '[CASEWORKER]',
+  '[IDVA]',
+  '[JUDGE]',
+  '[BAILIFF]',
+  '[DUTY SOLICITOR]',
+  '[NEIGHBOUR]',
+  '[WITNESS]',
+  '[THIRD PARTY]',
+  '[ADVISER]',
+]);
+
+/**
+ * Titles/honorifics to prepend when generating standard name variations.
+ * Neutral coverage — gender isn't inferrable from a name, so we seed
+ * every common form; only the one that actually appears in the document
+ * will match at replace time.
+ */
+const PERSON_NAME_TITLES = [
+  'Mr', 'Mrs', 'Ms', 'Miss', 'Mx', 'Dr', 'Prof', 'Sir', 'Dame',
+];
+
+/**
  * Categories that should never be shown as "unresolved" flags: they are
  * preserved verbatim and do not need review.
  */
@@ -765,6 +814,16 @@ async function loadMapping(rawHandle, caseId) {
   if (existing && existing.version === 1) {
     if (!Array.isArray(existing.safeList)) existing.safeList = [];
     if (!existing.sanitisedFilenames || typeof existing.sanitisedFilenames !== 'object') existing.sanitisedFilenames = {};
+    // Backfill standard name variations for entries created before the
+    // feature landed. `variationsSeeded` guards against re-adding
+    // variants the adviser has since deleted.
+    let backfilled = false;
+    for (const entry of (existing.entries || [])) {
+      if (entry && !entry.variationsSeeded && seedNameVariations(entry)) backfilled = true;
+    }
+    if (backfilled) {
+      try { await saveMapping(rawHandle, existing); } catch { /* non-fatal */ }
+    }
     return existing;
   }
   return {
@@ -2469,13 +2528,15 @@ function finaliseDecisions(decisions, mapping) {
       const tok = tokens[i];
       finalDecisions[intent.primaryIndex].token = tok;
       for (const li of intent.linkedIndices) finalDecisions[li].token = tok;
-      mapping.entries.push({
+      const newEntry = {
         original: intent.text,
         token: tok,
         category: intent.category,
         aliases: [],
         createdAt: now,
-      });
+      };
+      seedNameVariations(newEntry);
+      mapping.entries.push(newEntry);
     });
   }
   return { finalDecisions, mappingUpdates: aliasUpdates };
@@ -3871,6 +3932,106 @@ function normaliseCustomToken(raw) {
   else if (!out.startsWith('[') && out.endsWith(']')) out = '[' + out;
   else if (!out.startsWith('[') && !out.endsWith(']')) out = '[' + out + ']';
   return out;
+}
+
+/**
+ * Split a name into first / middle(s) / last, stripping any leading
+ * title. Returns null for a single-word name (no useful variants) or an
+ * empty string. Trailing suffixes like "Jr" / "III" are treated as part
+ * of the last-name segment so the surname still matches literally.
+ */
+function splitNameParts(name) {
+  const raw = String(name || '').trim().replace(/\s+/g, ' ');
+  if (!raw) return null;
+  const words = raw.split(' ');
+  // Peel off a leading title so the variant generator doesn't stack them.
+  const titleRx = new RegExp('^(' + PERSON_NAME_TITLES.join('|') + ')\\.?$', 'i');
+  if (words.length > 1 && titleRx.test(words[0])) words.shift();
+  if (words.length < 2) return null;
+  const first = words[0];
+  const last = words[words.length - 1];
+  const middles = words.slice(1, -1);
+  return { first, middles, last, full: words.join(' ') };
+}
+
+/**
+ * Generate standard name variations for a person's name so shorthand
+ * references get sanitised alongside the full form. E.g. from
+ * "Gary Michael Martino" we seed:
+ *   Gary, Gary Martino, Gary Michael Martino,
+ *   Mr Gary Michael Martino, Mr Gary Martino, Mr Martino,
+ *   Mr G Martino, Mr G. Martino, Mr GM Martino, Mr G M Martino,
+ *   Mr G.M. Martino, Mr G. M. Martino, ... (across all common titles)
+ *
+ * The bare last name alone ("Martino") is deliberately NOT included:
+ * it's too prone to matching unrelated words. The adviser can add it
+ * manually via the mapping editor if the case warrants it.
+ */
+function generateNameVariations(name) {
+  const parts = splitNameParts(name);
+  if (!parts) return [];
+  const { first, middles, last, full } = parts;
+  const firstInitial = first[0];
+  const middleInitials = middles.map((m) => m[0]).filter(Boolean);
+  const out = new Set();
+
+  out.add(first);
+  out.add(`${first} ${last}`);
+  out.add(full);
+
+  const bases = [full, `${first} ${last}`, last];
+  const initialForms = [
+    `${firstInitial} ${last}`,
+    `${firstInitial}. ${last}`,
+  ];
+  if (middleInitials.length) {
+    const spacedInitials = [firstInitial, ...middleInitials].join(' ');
+    const joinedInitials = [firstInitial, ...middleInitials].join('');
+    const dottedSpaced = [firstInitial, ...middleInitials].map((i) => i + '.').join(' ');
+    const dottedJoined = [firstInitial, ...middleInitials].map((i) => i + '.').join('');
+    initialForms.push(
+      `${spacedInitials} ${last}`,
+      `${joinedInitials} ${last}`,
+      `${dottedSpaced} ${last}`,
+      `${dottedJoined} ${last}`,
+    );
+  }
+
+  for (const title of PERSON_NAME_TITLES) {
+    for (const base of bases) out.add(`${title} ${base}`);
+    for (const form of initialForms) out.add(`${title} ${form}`);
+  }
+
+  const originalLc = full.toLowerCase();
+  return Array.from(out).filter((v) => v.toLowerCase() !== originalLc);
+}
+
+/**
+ * Merge freshly generated variations into an entry's alias list without
+ * duplicating anything the user (or a prior run) already added.
+ * Returns true if aliases were added.
+ */
+function seedNameVariations(entry) {
+  if (!entry || !entry.token || !entry.original) return false;
+  // Numbered person-role tokens ([CL_1], [LANDLORD_2]) collapse to their
+  // base role for the person-check.
+  const baseTok = entry.token.replace(/_\d+\]$/, ']');
+  if (!PERSON_NAME_ROLES.has(baseTok)) return false;
+  const variants = generateNameVariations(entry.original);
+  if (!variants.length) return false;
+  if (!entry.aliases) entry.aliases = [];
+  const have = new Set([entry.original.toLowerCase(), ...entry.aliases.map((a) => a.toLowerCase())]);
+  let added = 0;
+  for (const v of variants) {
+    if (have.has(v.toLowerCase())) continue;
+    have.add(v.toLowerCase());
+    entry.aliases.push(v);
+    added++;
+  }
+  // Mark so backfill on later loads doesn't re-add variants the adviser
+  // has since deleted from the mapping editor.
+  entry.variationsSeeded = true;
+  return added > 0;
 }
 
 /**
