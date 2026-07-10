@@ -29,6 +29,15 @@ Phase 1 only handles plain-text files (`.txt`, `.md`, and other UTF-8 readable c
 
 With a file open, click **Sanitise this file**. The review dialog lists every detected identifier along with a suggested action. Address lines and possible names start unresolved and must be given a decision. You can change any suggestion, add a custom role, or preserve an item as-is.
 
+The detected text on the left of each row is **editable**. If the detector captured a wrong boundary, for example "Hi Kieran" when only "Kieran" is the name, type the correction in the field and the tool re-anchors the span to the new text within the surrounding context. The category, action, and token controls stay attached to the corrected span.
+
+Every row also has two safe-list buttons:
+
+- **Safe here** adds the current text (after any edit) to the case's safe list, stored in `_mapping.json`. That string will not be flagged again while working on this case.
+- **Safe everywhere** adds the text to the global safe list, stored in `_settings.json` at the casework root. That string will not be flagged in any case.
+
+Both buttons also switch the row's action to **Preserve** since you would not tokenise a string you have just declared safe.
+
 When you click **Save sanitised file**:
 
 - The mapping records every new identifier so subsequent files in the case use the same tokens.

@@ -44,3 +44,13 @@ Built:
 - Extension-aware unsupported-file detection. Opening a `.pdf`, `.msg`, `.docx`, `.xls*`, or image file now shows a clear explanation and points the adviser at the paste-text failsafe instead of trying to render the raw bytes.
 - Binary heuristic fallback for files with unfamiliar extensions: if the first kilobyte contains more than 5% control characters (excluding tab, CR, LF), the file is treated as unsupported.
 - Audit log now records paste-text events with the optional source note.
+
+## Phase 1.2: editable spans, safe lists, and more stopwords
+
+Prompted by feedback that "Hi Kieran" was being picked up as a name when only "Kieran" was the name, and that there was no way to teach the tool about names that are known-safe:
+
+- The **detected text on each review row is now editable**. Type a corrected boundary and the tool re-anchors the span to the new text within a 100-character window either side of the original position. Anchoring uses the original position rather than the last-edited one, so successive edits do not drift.
+- Two new per-row buttons: **Safe here** and **Safe everywhere**. Both switch the row's action to Preserve. Safe here adds the text to a new `safeList` array in the case's `_mapping.json`. Safe everywhere additionally adds it to a global `_settings.json` at the casework root. Detection consults both lists before every review.
+- Common salutation words added to the built-in stopword list: Hi, Hello, Hey, Cheers, Best, Thanks, Thank, Warm, Warmest, Also, Please, Attn, FAO. "Hi Kieran" no longer surfaces as a name candidate at all.
+- Audit log records the safe-list additions alongside the sanitisation event.
+- `_settings.json` file schema is versioned so future settings additions can be handled without breaking existing installations.

@@ -261,6 +261,8 @@ const CURRENCY = /£\s?\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?|\b\d{1,3}(?:,\d{3})*(?:\
  */
 const NAME_STOPWORDS = new Set([
   'Dear', 'Yours', 'Regards', 'Kind', 'Sincerely', 'Faithfully',
+  'Hi', 'Hello', 'Hey', 'Cheers', 'Best', 'Thanks', 'Thank',
+  'Warm', 'Warmest', 'Also', 'Please', 'Attn', 'FAO',
   'Mr', 'Mrs', 'Ms', 'Miss', 'Mx', 'Dr', 'Sir', 'Madam',
   'January', 'February', 'March', 'April', 'May', 'June',
   'July', 'August', 'September', 'October', 'November', 'December',
@@ -620,13 +622,39 @@ const MAPPING_FILENAME = '_mapping.json';
 
 async function loadMapping(rawHandle, caseId) {
   const existing = await readJSON(rawHandle, MAPPING_FILENAME);
-  if (existing && existing.version === 1) return existing;
+  if (existing && existing.version === 1) {
+    if (!Array.isArray(existing.safeList)) existing.safeList = [];
+    return existing;
+  }
   return {
     version: 1,
     caseId,
     createdAt: new Date().toISOString(),
     entries: [],
+    safeList: [],
   };
+}
+
+/**
+ * Global settings live in _settings.json at the casework root, next to
+ * the four canonical folder mirrors. Currently only holds a globally
+ * scoped safe list of strings to skip during detection across every
+ * case. Later phases may add custom regex patterns and known-safe
+ * identities here.
+ */
+const SETTINGS_FILENAME = '_settings.json';
+
+async function loadGlobalSettings(rootHandle) {
+  const existing = await readJSON(rootHandle, SETTINGS_FILENAME);
+  if (existing && existing.version === 1) {
+    if (!Array.isArray(existing.safeList)) existing.safeList = [];
+    return existing;
+  }
+  return { version: 1, safeList: [] };
+}
+
+async function saveGlobalSettings(rootHandle, settings) {
+  await writeJSON(rootHandle, SETTINGS_FILENAME, settings);
 }
 
 async function saveMapping(rawHandle, mapping) {
@@ -827,7 +855,7 @@ const headerSentinel = HEADER_START;
  * address-line detector, an NI number wins over "possible name", and so
  * on. Specificity is expressed as detector order in DETECTORS.
  */
-function detectEntities(text, mapping) {
+function detectEntities(text, mapping, safeSet) {
   const raw = [];
   DETECTORS.forEach((d, order) => {
     const spans = d.run(text);
@@ -840,12 +868,28 @@ function detectEntities(text, mapping) {
   });
   const chosen = [];
   let cursor = -1;
+  const skipCheck = safeSet && safeSet.size ? safeSet : null;
   for (const s of raw) {
     if (s.start < cursor) continue;
+    if (skipCheck && skipCheck.has(s.text.toLowerCase())) {
+      cursor = s.end;
+      continue;
+    }
     chosen.push(s);
     cursor = s.end;
   }
   return chosen.map((s) => decorateWithMapping(s, mapping, text));
+}
+
+/**
+ * Build a single lowercased Set from the case and global safe lists so
+ * detection has one thing to consult per span.
+ */
+function buildSafeSet(caseSafeList, globalSafeList) {
+  const set = new Set();
+  for (const entry of caseSafeList || []) set.add(String(entry).toLowerCase());
+  for (const entry of globalSafeList || []) set.add(String(entry).toLowerCase());
+  return set;
 }
 
 function decorateWithMapping(span, mapping, text) {
@@ -1178,7 +1222,9 @@ function isSoftReopen(closure) {
 
 function openReviewDialog(entities, mapping, options = {}) {
   return new Promise((resolve) => {
+    const documentText = options.documentText || '';
     const decisions = entities.map((e) => initialDecision(e, mapping));
+    const safeListUpdates = [];
 
     const root = document.getElementById('dialog-root');
     root.innerHTML = '';
@@ -1187,21 +1233,21 @@ function openReviewDialog(entities, mapping, options = {}) {
     backdrop.className = 'modal-backdrop';
     const modal = document.createElement('div');
     modal.className = 'modal';
-    modal.style.width = '900px';
+    modal.style.width = '960px';
     backdrop.appendChild(modal);
 
     modal.innerHTML = `
       <div class="modal-header">Review detected entities: ${escapeHtml(options.title || 'file')}</div>
       <div class="modal-body">
-        <p class="muted">Assign a role or preserve for each item. Anything highlighted in orange requires a decision before saving.</p>
+        <p class="muted">The detected text on the left is editable, so you can trim a wrongly captured boundary (for example changing "Hi Kieran" to "Kieran"). Use "Safe here" or "Safe everywhere" to record that a specific string should be skipped by future detection.</p>
         <div id="review-summary" class="muted" style="margin-bottom:8px"></div>
         <table class="entity-table">
           <thead>
             <tr>
-              <th style="width:32%">Detected</th>
-              <th style="width:14%">Category</th>
+              <th style="width:36%">Detected (editable)</th>
+              <th style="width:12%">Category</th>
               <th style="width:22%">Action</th>
-              <th style="width:32%">Token or replacement</th>
+              <th style="width:30%">Token or replacement</th>
             </tr>
           </thead>
           <tbody id="review-body"></tbody>
@@ -1227,31 +1273,59 @@ function openReviewDialog(entities, mapping, options = {}) {
     });
 
     modal.addEventListener('input', (ev) => {
+      const rowEl = ev.target.closest('tr[data-idx]');
+      if (!rowEl) return;
+      const idx = Number(rowEl.dataset.idx);
       if (ev.target.matches('input[data-role="custom"]')) {
-        const rowEl = ev.target.closest('tr[data-idx]');
-        const idx = Number(rowEl.dataset.idx);
         decisions[idx].token = ev.target.value;
+        updateSummary(modal, decisions);
+      } else if (ev.target.matches('input[data-role="span-text"]')) {
+        const ok = repositionSpan(decisions[idx], ev.target.value, documentText);
+        updateContextDisplay(rowEl, decisions[idx]);
+        markInvalidText(rowEl, !ok);
         updateSummary(modal, decisions);
       }
     });
 
     modal.addEventListener('click', (ev) => {
+      const rowEl = ev.target.closest('tr[data-idx]');
+      if (rowEl) {
+        const idx = Number(rowEl.dataset.idx);
+        const role = ev.target.dataset && ev.target.dataset.role;
+        if (role === 'safe-case' || role === 'safe-global') {
+          const scope = role === 'safe-global' ? 'global' : 'case';
+          const text = decisions[idx].text.trim();
+          if (!text) { return; }
+          if (!safeListUpdates.some((u) => u.text.toLowerCase() === text.toLowerCase() && u.scope === scope)) {
+            safeListUpdates.push({ text, scope });
+          }
+          decisions[idx].action = 'preserve';
+          refreshRow(rowEl, decisions[idx]);
+          markSafeChip(rowEl, scope);
+          updateSummary(modal, decisions);
+          return;
+        }
+      }
       const action = ev.target.dataset && ev.target.dataset.action;
       if (action === 'cancel') {
         cleanup();
         resolve(null);
       } else if (action === 'save') {
         const unresolved = decisions.filter(isUnresolved);
-        if (unresolved.length) {
+        const invalid = decisions.filter((d) => d.action !== 'preserve' && d.textInvalid);
+        if (unresolved.length || invalid.length) {
           highlightUnresolved(tbody, decisions);
           const summary = modal.querySelector('#review-summary');
-          summary.textContent = `${unresolved.length} item${unresolved.length === 1 ? '' : 's'} still need a decision.`;
+          const parts = [];
+          if (unresolved.length) parts.push(`${unresolved.length} still need a decision`);
+          if (invalid.length) parts.push(`${invalid.length} have edited text that no longer matches the document`);
+          summary.textContent = parts.join(' and ') + '.';
           summary.classList.add('warning');
           return;
         }
         const { finalDecisions, mappingUpdates } = finaliseDecisions(decisions, mapping);
         cleanup();
-        resolve({ decisions: finalDecisions, mappingUpdates });
+        resolve({ decisions: finalDecisions, mappingUpdates, safeListUpdates });
       }
     });
 
@@ -1260,12 +1334,65 @@ function openReviewDialog(entities, mapping, options = {}) {
   });
 }
 
+/**
+ * Search for `newText` inside a window around the entity's original
+ * position (`originalStart` / `originalEnd`). Anchor to the original
+ * position rather than the current one so that repeated edits do not
+ * drift down the document.
+ */
+function repositionSpan(decision, newText, documentText) {
+  decision.text = newText;
+  const trimmed = newText.trim();
+  if (!trimmed || !documentText) {
+    decision.textInvalid = !!trimmed;
+    return false;
+  }
+  const win = 100;
+  const origStart = decision.originalStart != null ? decision.originalStart : decision.start;
+  const origEnd = decision.originalEnd != null ? decision.originalEnd : decision.end;
+  const winStart = Math.max(0, origStart - win);
+  const winEnd = Math.min(documentText.length, origEnd + win);
+  const slice = documentText.slice(winStart, winEnd);
+  let idx = slice.indexOf(trimmed);
+  if (idx === -1) idx = slice.toLowerCase().indexOf(trimmed.toLowerCase());
+  if (idx === -1) { decision.textInvalid = true; return false; }
+  decision.start = winStart + idx;
+  decision.end = winStart + idx + trimmed.length;
+  decision.text = documentText.slice(decision.start, decision.end);
+  decision.contextBefore = documentText.slice(Math.max(0, decision.start - 30), decision.start);
+  decision.contextAfter = documentText.slice(decision.end, Math.min(documentText.length, decision.end + 30));
+  decision.textInvalid = false;
+  return true;
+}
+
+function updateContextDisplay(rowEl, decision) {
+  const el = rowEl.querySelector('[data-role="context"]');
+  if (el) {
+    el.textContent = `${decision.contextBefore}⟨${decision.text}⟩${decision.contextAfter}`;
+  }
+}
+
+function markInvalidText(rowEl, invalid) {
+  const el = rowEl.querySelector('[data-role="edit-status"]');
+  if (el) el.hidden = !invalid;
+}
+
+function markSafeChip(rowEl, scope) {
+  const el = rowEl.querySelector('[data-role="safe-status"]');
+  if (!el) return;
+  el.hidden = false;
+  el.textContent = scope === 'global' ? 'Marked safe everywhere' : 'Marked safe in this case';
+}
+
 function initialDecision(entity, mapping) {
   const base = {
     ...entity,
     action: 'unresolved',
     token: '',
     replacement: null,
+    originalStart: entity.start,
+    originalEnd: entity.end,
+    textInvalid: false,
   };
   if (entity.known) {
     base.action = 'tokenise';
@@ -1293,14 +1420,18 @@ function initialDecision(entity, mapping) {
 function renderRow(decision, idx) {
   const tr = document.createElement('tr');
   tr.dataset.idx = String(idx);
-  const original = escapeHtml(decision.text);
-  const context = escapeHtml(`${decision.contextBefore}⟨${decision.text}⟩${decision.contextAfter}`);
   const catLabel = CATEGORY_LABELS[decision.category] || decision.category;
   const flag = JUDGEMENT_CATEGORIES.has(decision.category) ? '<span class="chip flag">review</span>' : '';
   tr.innerHTML = `
     <td>
-      <div class="entity-original">${original}</div>
-      <div class="entity-category">${escapeHtml(context)}</div>
+      <input class="entity-original" style="width:100%;font-family:var(--mono);font-size:12px;padding:4px 6px;" data-role="span-text" type="text" value="${escapeHtml(decision.text)}">
+      <div class="entity-category" data-role="context" style="margin-top:2px">${escapeHtml(`${decision.contextBefore}⟨${decision.text}⟩${decision.contextAfter}`)}</div>
+      <div style="margin-top:4px;display:flex;gap:4px;flex-wrap:wrap;align-items:center">
+        <button type="button" data-role="safe-case" style="padding:2px 8px;font-size:11px">Safe here</button>
+        <button type="button" data-role="safe-global" style="padding:2px 8px;font-size:11px" title="Add this text to the global safe list, so no case flags it again">Safe everywhere</button>
+        <span class="chip" data-role="safe-status" hidden></span>
+        <span class="chip flag" data-role="edit-status" hidden>Edited text not found in the document</span>
+      </div>
     </td>
     <td>${flag}<span class="entity-category">${escapeHtml(catLabel)}</span></td>
     <td>${renderActionSelect(decision)}</td>
@@ -1358,7 +1489,9 @@ function updateDecisionFromRow(decision, rowEl) {
 }
 
 function refreshRow(rowEl, decision) {
+  const actionCell = rowEl.children[2];
   const tokenCell = rowEl.children[3];
+  actionCell.innerHTML = renderActionSelect(decision);
   tokenCell.innerHTML = renderTokenControl(decision);
 }
 
@@ -1525,6 +1658,7 @@ const state = {
   currentSanitisedMtime: null,
   currentOriginalMtime: null,
   currentMapping: null,
+  globalSettings: { version: 1, safeList: [] },
 };
 
 document.addEventListener('DOMContentLoaded', init);
@@ -1552,6 +1686,7 @@ function init() {
 async function onOpenRoot() {
   try {
     state.handles = await pickRoot();
+    state.globalSettings = await loadGlobalSettings(state.handles.root);
     document.getElementById('root-path').textContent = 'Casework folder ready';
     await refreshCases();
   } catch (err) {
@@ -1816,14 +1951,17 @@ async function onSanitise() {
   const c = state.cases.find((x) => x.id === state.selectedCaseId);
   if (!c || !state.selectedFile) return;
   const mapping = state.currentMapping;
-  const entities = detectEntities(state.currentText, mapping);
-  const result = await openReviewDialog(entities, mapping, { title: state.selectedFile });
+  const safeSet = buildSafeSet(mapping.safeList, state.globalSettings.safeList);
+  const entities = detectEntities(state.currentText, mapping, safeSet);
+  const result = await openReviewDialog(entities, mapping, {
+    title: state.selectedFile,
+    documentText: state.currentText,
+  });
   if (!result) return;
-  // New entries were pushed onto mapping.entries inside finaliseDecisions.
-  // mappingUpdates only carries alias additions to existing entries.
   for (const upd of result.mappingUpdates) {
     if (upd.aliasFor) addAlias(mapping, upd.aliasFor, upd.alias);
   }
+  const safeAudit = await persistSafeListUpdates(mapping, result.safeListUpdates || []);
   const sanitised = applySanitisation(state.currentText, result.decisions);
   const offenders = checkOutgoing(sanitised, mapping);
   if (offenders.length) {
@@ -1839,10 +1977,39 @@ async function onSanitise() {
   const output = header + sanitised;
   await writeFileText(c.sanHandle, state.selectedFile, output);
   await saveMapping(c.rawHandle, mapping);
-  await appendAudit(c.rawHandle, `Sanitised: ${state.selectedFile} (${result.decisions.length} decisions, ${result.mappingUpdates.length} new mapping entries)`);
+  await appendAudit(c.rawHandle, `Sanitised: ${state.selectedFile} (${result.decisions.length} decisions, ${result.mappingUpdates.length} new mapping entries)${safeAudit ? `; ${safeAudit}` : ''}`);
   state.currentMapping = mapping;
   await selectFile(state.selectedFile);
   showToast('Sanitised file written.');
+}
+
+/**
+ * Fold the review dialog's safe-list updates into the case mapping and
+ * the global settings, and persist whichever ones changed. Returns a
+ * short audit summary or an empty string.
+ */
+async function persistSafeListUpdates(mapping, updates) {
+  if (!updates.length) return '';
+  let addedCase = 0;
+  let addedGlobal = 0;
+  const lowerIn = (arr, s) => arr.some((x) => String(x).toLowerCase() === s.toLowerCase());
+  for (const upd of updates) {
+    if (!lowerIn(mapping.safeList, upd.text)) {
+      mapping.safeList.push(upd.text);
+      addedCase++;
+    }
+    if (upd.scope === 'global' && !lowerIn(state.globalSettings.safeList, upd.text)) {
+      state.globalSettings.safeList.push(upd.text);
+      addedGlobal++;
+    }
+  }
+  if (addedGlobal) {
+    await saveGlobalSettings(state.handles.root, state.globalSettings);
+  }
+  const parts = [];
+  if (addedCase) parts.push(`${addedCase} added to case safe list`);
+  if (addedGlobal) parts.push(`${addedGlobal} added to global safe list`);
+  return parts.join(', ');
 }
 
 async function onCopySanitised() {
