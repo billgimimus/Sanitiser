@@ -3873,20 +3873,51 @@ function normaliseCustomToken(raw) {
   return out;
 }
 
+/**
+ * Generate common separator variants of a multi-word identifier so the
+ * filename check catches forms like "DaleMuntzArrearsLetter" where the
+ * client's name has been jammed together with no separator. For a
+ * single word the only variant is the word itself.
+ */
+function filenameNeedleVariants(text) {
+  const trimmed = String(text || '').trim();
+  if (!trimmed) return [];
+  const parts = trimmed.split(/\s+/).filter(Boolean);
+  if (parts.length <= 1) return [trimmed];
+  return [
+    trimmed,
+    parts.join(''),
+    parts.join('_'),
+    parts.join('-'),
+    parts.join('.'),
+  ];
+}
+
 function sanitiseFilenameForHeader(filename, mapping) {
   if (!filename) return filename;
   let out = String(filename);
-  const entries = [...((mapping && mapping.entries) || [])]
-    .filter((e) => e && e.original && e.token)
-    .sort((a, b) => (b.original.length + (b.aliases || []).length) - (a.original.length + (a.aliases || []).length));
+  const needles = [];
+  const entries = ((mapping && mapping.entries) || []).filter((e) => e && e.original && e.token);
   for (const e of entries) {
     const strings = [e.original, ...((e.aliases || []))];
     for (const s of strings) {
       if (!s || s.length < 2) continue;
-      const escaped = s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const rx = new RegExp(escaped, 'gi');
-      out = out.replace(rx, e.token);
+      for (const v of filenameNeedleVariants(s)) {
+        if (v && v.length >= 2) needles.push({ needle: v, token: e.token });
+      }
     }
+  }
+  // Try longer variants first so "DaleMuntz" beats an alias "Dale" and
+  // "Dale Muntz" beats an alias "Muntz".
+  needles.sort((a, b) => b.needle.length - a.needle.length);
+  const seen = new Set();
+  for (const n of needles) {
+    const key = n.needle.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const escaped = n.needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const rx = new RegExp(escaped, 'gi');
+    out = out.replace(rx, n.token);
   }
   return out;
 }
