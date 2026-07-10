@@ -33,3 +33,14 @@ Deviations from the spec:
 - The project is laid out at the git repository root rather than inside a `casework-sanitiser/` subdirectory. The repository is dedicated to this tool, so the extra nesting adds nothing.
 - The JavaScript is shipped as a single concatenated `js/app.js` rather than a tree of ES modules under `js/`. The briefing asked for both "ES modules split across files" and "must run by opening index.html directly", which are in genuine conflict: Chromium browsers refuse to load ES modules from `file://` URLs. Given the choice between shipping module structure and needing a local static server, or shipping one flat file and having double-click work, we chose the latter. Section markers in `js/app.js` preserve the module boundaries for navigation. Any future editing happens in `app.js` directly.
 - A fallback banner in `index.html` shows a visible error if `js/app.js` fails to load or execute, so the failure mode observed on first ship is not silent again.
+
+## Phase 1.1: failsafe paste input and unsupported-file handling
+
+Prompted by first real-use feedback: dragging PDFs and `.msg` files into a case produced garbled bytes in the Original tab because the tool tried to decode them as UTF-8 text.
+
+Built:
+
+- **Paste text as new file** button on every open case. Opens a modal with a filename field, an optional source note (recorded in the audit log), and a text area. Saves the pasted content as a plain `.txt` inside the case and opens it ready for sanitisation.
+- Extension-aware unsupported-file detection. Opening a `.pdf`, `.msg`, `.docx`, `.xls*`, or image file now shows a clear explanation and points the adviser at the paste-text failsafe instead of trying to render the raw bytes.
+- Binary heuristic fallback for files with unfamiliar extensions: if the first kilobyte contains more than 5% control characters (excluding tab, CR, LF), the file is treated as unsupported.
+- Audit log now records paste-text events with the optional source note.

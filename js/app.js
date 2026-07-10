@@ -1616,6 +1616,11 @@ function renderSidebar() {
       actions.style.display = 'flex';
       actions.style.gap = '6px';
       if (c.kind === 'open') {
+        const btnPaste = document.createElement('button');
+        btnPaste.textContent = 'Paste text as new file';
+        btnPaste.title = 'Failsafe for content the tool cannot yet extract from PDFs or .msg files. Paste in the text, name the file, and the tool saves it as a .txt inside the case.';
+        btnPaste.addEventListener('click', (ev) => { ev.stopPropagation(); onPasteTextToCase(c); });
+        actions.appendChild(btnPaste);
         const btnClose = document.createElement('button');
         btnClose.textContent = 'Close case';
         btnClose.addEventListener('click', (ev) => { ev.stopPropagation(); onCloseCase(c); });
@@ -1669,7 +1674,28 @@ async function selectFile(name) {
   const c = state.cases.find((x) => x.id === state.selectedCaseId);
   if (!c) return;
   try {
+    const unsupported = classifyUnsupported(name);
+    if (unsupported) {
+      state.currentText = null;
+      state.currentOriginalMtime = null;
+      state.currentSanitised = null;
+      state.currentSanitisedMtime = null;
+      state.currentMapping = await loadMapping(c.rawHandle, c.id);
+      renderUnsupportedFileView(name, c, unsupported);
+      renderSidebar();
+      return;
+    }
     const { text, lastModified } = await readFileText(c.rawHandle, name);
+    if (looksBinary(text)) {
+      state.currentText = null;
+      state.currentOriginalMtime = null;
+      state.currentSanitised = null;
+      state.currentSanitisedMtime = null;
+      state.currentMapping = await loadMapping(c.rawHandle, c.id);
+      renderUnsupportedFileView(name, c, 'The content of this file does not look like plain text. It may be a binary format the tool cannot yet parse.');
+      renderSidebar();
+      return;
+    }
     state.currentText = text;
     state.currentOriginalMtime = lastModified;
     state.currentSanitised = null;
@@ -1689,12 +1715,78 @@ async function selectFile(name) {
   }
 }
 
+/**
+ * Return a human-readable reason if the file cannot yet be shown as text
+ * based on extension alone, or null if it should be attempted.
+ */
+function classifyUnsupported(name) {
+  const lower = name.toLowerCase();
+  const map = [
+    ['.pdf', 'PDFs are not yet extracted by the tool. PDF.js integration is phase 2.'],
+    ['.msg', 'Outlook .msg files are binary. Native parsing is phase 2 (msgreader).'],
+    ['.doc', 'Legacy .doc format is not supported. Copy the text out and paste it back in.'],
+    ['.docx', '.docx files are not yet parsed. Copy the text out and paste it back in.'],
+    ['.xls', 'Excel files are not supported.'],
+    ['.xlsx', 'Excel files are not supported.'],
+    ['.png', 'Image files are not supported. Phase 2 adds OCR (Tesseract) if needed.'],
+    ['.jpg', 'Image files are not supported. Phase 2 adds OCR (Tesseract) if needed.'],
+    ['.jpeg', 'Image files are not supported. Phase 2 adds OCR (Tesseract) if needed.'],
+    ['.gif', 'Image files are not supported.'],
+    ['.zip', 'Archive files are not opened by the tool.'],
+  ];
+  for (const [ext, reason] of map) {
+    if (lower.endsWith(ext)) return reason;
+  }
+  return null;
+}
+
+/**
+ * Rough binary heuristic: count control characters (excluding tab, CR,
+ * LF) in the first kilobyte. If they are more than 5% of the sample, the
+ * content is almost certainly not human text.
+ */
+function looksBinary(text) {
+  if (!text) return false;
+  const sample = text.slice(0, 1024);
+  if (!sample.length) return false;
+  let ctrl = 0;
+  for (let i = 0; i < sample.length; i++) {
+    const c = sample.charCodeAt(i);
+    if (c === 9 || c === 10 || c === 13) continue;
+    if (c < 32 || c === 65533) ctrl++;
+  }
+  return (ctrl / sample.length) > 0.05;
+}
+
+function renderUnsupportedFileView(name, caseObj, reason) {
+  document.getElementById('welcome').hidden = true;
+  document.getElementById('file-view').hidden = false;
+  document.getElementById('file-name').textContent = name;
+  document.getElementById('file-case').textContent = `Case ${caseObj.id}`;
+  const banner = `This file cannot be shown or sanitised in its current form. ${escapeHtml(reason)} As a failsafe, use "Paste text as new file" on the case row: open ${escapeHtml(name)} in its native viewer, copy the text you want to send to Claude, and paste it in. The tool saves the pasted text as a .txt inside the case and sanitises it normally.`;
+  const pre = document.getElementById('original-content');
+  pre.innerHTML = '';
+  const div = document.createElement('div');
+  div.className = 'warning';
+  div.innerHTML = banner;
+  pre.appendChild(div);
+  document.getElementById('sanitised-content').textContent = '';
+  document.getElementById('sanitised-status').textContent = 'Not applicable for this file type.';
+  document.getElementById('stale-warning').hidden = true;
+  document.getElementById('btn-resanitise').hidden = true;
+  document.getElementById('btn-copy-sanitised').disabled = true;
+  document.getElementById('btn-sanitise').disabled = true;
+  switchFileTab('original');
+}
+
 function renderFileView(name, caseObj, text, sanitisedText) {
   document.getElementById('welcome').hidden = true;
   document.getElementById('file-view').hidden = false;
   document.getElementById('file-name').textContent = name;
   document.getElementById('file-case').textContent = `Case ${caseObj.id}`;
-  document.getElementById('original-content').textContent = text;
+  const pre = document.getElementById('original-content');
+  pre.innerHTML = '';
+  pre.textContent = text;
   document.getElementById('sanitised-content').textContent = sanitisedText || '';
   document.getElementById('sanitised-status').textContent = sanitisedText
     ? 'This file has been sanitised.'
@@ -1703,6 +1795,7 @@ function renderFileView(name, caseObj, text, sanitisedText) {
   document.getElementById('stale-warning').hidden = !stale;
   document.getElementById('btn-resanitise').hidden = !sanitisedText;
   document.getElementById('btn-copy-sanitised').disabled = !sanitisedText;
+  document.getElementById('btn-sanitise').disabled = false;
   switchFileTab('original');
 }
 
@@ -1848,6 +1941,90 @@ function showRehydrateIntegrityDialog(hits, replaced, cleaned, mapping) {
     });
     root.appendChild(backdrop);
   });
+}
+
+/**
+ * Failsafe input path for content the tool cannot yet extract from
+ * emails, PDFs, or other binary formats. The adviser opens the source
+ * in its native viewer, copies the text they want, and pastes it in
+ * here. The pasted text is saved as a plain .txt inside the case, and
+ * flows through the normal sanitise / rehydrate path from there.
+ */
+function onPasteTextToCase(caseObj) {
+  return new Promise((resolve) => {
+    const root = document.getElementById('dialog-root');
+    root.innerHTML = '';
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop';
+    const modal = document.createElement('div');
+    modal.className = 'modal';
+    modal.style.width = '720px';
+    backdrop.appendChild(modal);
+    const defaultName = buildPastedFilename();
+    modal.innerHTML = `
+      <div class="modal-header">Paste text as new file in ${escapeHtml(caseObj.id)}</div>
+      <div class="modal-body">
+        <p class="muted">Use this when the tool cannot yet parse the source (PDF, .msg, .docx). Open the source in its native viewer, copy the text, paste it here, and give the resulting file a name.</p>
+        <div class="form-row">
+          <label>Filename (kept as-is; .txt appended if missing)</label>
+          <input id="paste-filename" type="text" value="${escapeHtml(defaultName)}">
+        </div>
+        <div class="form-row">
+          <label>Optional source note (recorded in the audit log, not in the file)</label>
+          <input id="paste-source" type="text" placeholder="e.g. from Outlook: letter from Sheffield CC dated 10 July 2026">
+        </div>
+        <div class="form-row">
+          <label>Text</label>
+          <textarea id="paste-text" rows="16" style="font-family: var(--mono); font-size: 13px;" placeholder="Paste the text here..."></textarea>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button data-action="cancel">Cancel</button>
+        <button class="primary" data-action="save">Save into case</button>
+      </div>
+    `;
+    setTimeout(() => modal.querySelector('#paste-text').focus(), 0);
+    modal.addEventListener('click', async (ev) => {
+      const action = ev.target.dataset && ev.target.dataset.action;
+      if (action === 'cancel') { backdrop.remove(); resolve(); return; }
+      if (action !== 'save') return;
+      const rawName = modal.querySelector('#paste-filename').value.trim();
+      const text = modal.querySelector('#paste-text').value;
+      const source = modal.querySelector('#paste-source').value.trim();
+      if (!rawName) { showToast('Please give the file a name.', true); return; }
+      if (!text) { showToast('Please paste some text before saving.', true); return; }
+      let name = rawName;
+      if (!/\.[a-z0-9]{1,6}$/i.test(name)) name += '.txt';
+      const existing = (caseObj.files || []).some((f) => f.name.toLowerCase() === name.toLowerCase());
+      if (existing) {
+        if (!confirm(`A file called ${name} already exists in this case. Overwrite it?`)) return;
+      }
+      try {
+        await writeFileText(caseObj.rawHandle, name, text);
+        const sourceLine = source ? `, source: ${source}` : '';
+        await appendAudit(caseObj.rawHandle, `Pasted text saved as ${name} (${text.length} chars${sourceLine})`);
+        backdrop.remove();
+        await refreshCases();
+        await selectCase(caseObj.id);
+        await selectFile(name);
+        showToast(`Saved ${name} into ${caseObj.id}.`);
+        resolve();
+      } catch (err) {
+        showToast(`Could not save: ${err.message}`, true);
+      }
+    });
+    root.appendChild(backdrop);
+  });
+}
+
+function buildPastedFilename() {
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mn = String(d.getMinutes()).padStart(2, '0');
+  return `pasted_${yyyy}-${mm}-${dd}_${hh}${mn}.txt`;
 }
 
 async function onNewCase() {

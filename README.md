@@ -19,6 +19,12 @@ If the page shows a red banner saying the tool did not start, one of two things 
 3. Drag one or more files onto the case row in the sidebar to add them to the case.
 4. Click a file to open it. The Original tab shows the raw text; the Sanitised tab shows the tokenised copy once you sanitise it.
 
+## Emails, PDFs, and other formats the tool cannot yet parse
+
+Phase 1 only handles plain-text files (`.txt`, `.md`, and other UTF-8 readable content). Outlook `.msg` files, PDFs, `.docx`, and images are added in phase 2. For now, when you open a file the tool cannot read, you get a clear message rather than garbled bytes.
+
+**The failsafe** is a per-case button labelled **Paste text as new file**. Open the source in its native viewer (Outlook, a PDF reader, whatever), copy the text you want to send to Claude, and paste it into the modal. The tool saves it as a `.txt` inside the case folder, records the paste in the case audit log, and opens it ready to sanitise. The rest of the workflow, including the mapping and the reverse integrity check, is identical.
+
 ## Sanitise a document
 
 With a file open, click **Sanitise this file**. The review dialog lists every detected identifier along with a suggested action. Address lines and possible names start unresolved and must be given a decision. You can change any suggestion, add a custom role, or preserve an item as-is.
