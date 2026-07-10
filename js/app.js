@@ -770,6 +770,10 @@ async function ensureNerPipeline(onProgress) {
   try {
     const T = window.Transformers;
     T.env.backends.onnx.wasm.wasmPaths = 'lib/';
+    // file:// blocks SharedArrayBuffer, so the threaded WASM builds
+    // can never run here. Force single-threaded so ORT stops probing
+    // for a threaded backend and settles on ort-wasm-simd.wasm.
+    T.env.backends.onnx.wasm.numThreads = 1;
     T.env.allowLocalModels = false;
     const pipe = await T.pipeline('token-classification', NER_MODEL_ID, {
       quantized: true,
@@ -777,6 +781,15 @@ async function ensureNerPipeline(onProgress) {
     });
     state.nerPipeline = pipe;
     return pipe;
+  } catch (err) {
+    const wrapped = new Error(
+      `${err && err.message ? err.message : String(err)}. `
+      + `Check DevTools console for the underlying ONNX Runtime error. `
+      + `Common causes: the two vendored files lib/ort-wasm.wasm and `
+      + `lib/ort-wasm-simd.wasm are missing, the browser is offline for the `
+      + `first-run model download, or the huggingface.co host is blocked.`
+    );
+    throw wrapped;
   } finally {
     state.nerLoading = false;
   }
