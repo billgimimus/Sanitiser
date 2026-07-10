@@ -540,7 +540,8 @@ async function listCases(handles, kind) {
     } catch (_e) {
       sanHandle = null;
     }
-    const files = await listFiles(rawHandle, sanHandle);
+    const mapping = await readJSON(rawHandle, '_mapping.json');
+    const files = await listFiles(rawHandle, sanHandle, mapping);
     const meta = await tryReadClosure(rawHandle);
     cases.push({ id: entry.name, kind, rawHandle, sanHandle, files, meta });
   }
@@ -548,7 +549,7 @@ async function listCases(handles, kind) {
   return cases;
 }
 
-async function listFiles(rawHandle, sanHandle) {
+async function listFiles(rawHandle, sanHandle, mapping) {
   const out = [];
   const sanNames = new Set();
   if (sanHandle) {
@@ -556,15 +557,21 @@ async function listFiles(rawHandle, sanHandle) {
       if (s.kind === 'file') sanNames.add(s.name);
     }
   }
+  const filemap = (mapping && mapping.sanitisedFilenames) || {};
   for await (const entry of rawHandle.values()) {
     if (entry.kind !== 'file') continue;
     if (entry.name === '_mapping.json' || entry.name === '_closure.json' || entry.name === '_audit.log') continue;
     const file = await entry.getFile();
+    // If the mapping remembers a safe-form sanitised name for this raw
+    // file, use it; otherwise fall back to same-name pairing so files
+    // sanitised before this feature keep showing up correctly.
+    const sanName = filemap[entry.name] || entry.name;
     out.push({
       name: entry.name,
+      sanitisedName: sanName,
       size: file.size,
       lastModified: file.lastModified,
-      hasSanitised: sanNames.has(entry.name),
+      hasSanitised: sanNames.has(sanName) || sanNames.has(entry.name),
     });
   }
   out.sort((a, b) => a.name.localeCompare(b.name));
@@ -757,6 +764,7 @@ async function loadMapping(rawHandle, caseId) {
   const existing = await readJSON(rawHandle, MAPPING_FILENAME);
   if (existing && existing.version === 1) {
     if (!Array.isArray(existing.safeList)) existing.safeList = [];
+    if (!existing.sanitisedFilenames || typeof existing.sanitisedFilenames !== 'object') existing.sanitisedFilenames = {};
     return existing;
   }
   return {
@@ -765,6 +773,7 @@ async function loadMapping(rawHandle, caseId) {
     createdAt: new Date().toISOString(),
     entries: [],
     safeList: [],
+    sanitisedFilenames: {},
   };
 }
 
@@ -2715,7 +2724,8 @@ function renderSidebar() {
       for (const f of c.files) {
         const fitem = document.createElement('div');
         fitem.className = 'file-item' + (state.selectedFile === f.name ? ' selected' : '');
-        const badge = f.hasSanitised ? '<span class="file-badge done">sanitised</span>' : '<span class="file-badge">raw</span>';
+        const renamedBadge = f.hasSanitised && f.sanitisedName && f.sanitisedName !== f.name ? `<span class="file-badge" title="Sanitised copy saved as ${escapeHtml(f.sanitisedName)}">renamed</span>` : '';
+        const badge = f.hasSanitised ? `${renamedBadge}<span class="file-badge done">sanitised</span>` : '<span class="file-badge">raw</span>';
         const checked = state.selectedForBatch && state.selectedForBatch.has(`${c.id}::${f.name}`) ? ' checked' : '';
         const ckAttrs = f.hasSanitised ? '' : ' disabled title="This file has not been sanitised yet."';
         fitem.innerHTML = `<label class="file-item-batch" style="display:inline-flex;align-items:center;margin-right:6px;" title="Include this file in the multi-file Copy sanitised."><input type="checkbox" data-role="batch"${ckAttrs}${checked} style="cursor:pointer;"></label><span class="file-item-name">${escapeHtml(f.name)}</span><span class="file-item-right">${badge}<button class="file-item-del" data-role="delete" title="Delete this file from the case" type="button">×</button></span>`;
@@ -3191,12 +3201,24 @@ async function selectFile(name) {
     state.currentSanitisedMtime = null;
     state.currentMapping = await loadMapping(c.rawHandle, c.id);
     let sanitisedText = null;
+    const fileObj = (c.files || []).find((f) => f.name === name);
+    const sanName = (fileObj && fileObj.sanitisedName) || (state.currentMapping.sanitisedFilenames || {})[name] || name;
     try {
-      const { text: sText, lastModified: sMtime } = await readFileText(c.sanHandle, name);
+      const { text: sText, lastModified: sMtime } = await readFileText(c.sanHandle, sanName);
       sanitisedText = sText;
       state.currentSanitised = sText;
       state.currentSanitisedMtime = sMtime;
-    } catch (_e) { /* not yet sanitised */ }
+    } catch (_e) {
+      // Backward compatibility: if the mapped name is missing, try the raw name.
+      if (sanName !== name) {
+        try {
+          const { text: sText, lastModified: sMtime } = await readFileText(c.sanHandle, name);
+          sanitisedText = sText;
+          state.currentSanitised = sText;
+          state.currentSanitisedMtime = sMtime;
+        } catch (_e2) { /* not yet sanitised */ }
+      }
+    }
     renderFileView(name, c, text, sanitisedText);
     renderSidebar();
   } catch (err) {
@@ -4102,7 +4124,23 @@ async function onSanitise() {
     specialCategoryFlags: summariseSpecialCategoryFlags(specialFlags),
   });
   const output = header + sanitised;
-  await writeFileText(c.sanHandle, state.selectedFile, output);
+  // Rename the sanitised file if the raw filename contains identifiers.
+  // Raw file is left alone (adviser may want to keep it, and SharePoint
+  // sync may propagate renames). Track the raw -> safe pairing in the
+  // mapping so listFiles keeps the sidebar showing "sanitised" next to
+  // the raw file.
+  const outputSanitisedName = sanitisedSourceName || state.selectedFile;
+  await writeFileText(c.sanHandle, outputSanitisedName, output);
+  if (!mapping.sanitisedFilenames) mapping.sanitisedFilenames = {};
+  const previousSanName = mapping.sanitisedFilenames[state.selectedFile];
+  if (previousSanName && previousSanName !== outputSanitisedName) {
+    try { await deleteEntry(c.sanHandle, previousSanName); } catch (_e) { /* already gone */ }
+  }
+  if (outputSanitisedName !== state.selectedFile) {
+    // Also sweep a legacy same-name sanitised file that pre-dates this fix.
+    try { await deleteEntry(c.sanHandle, state.selectedFile); } catch (_e) { /* nothing to clean */ }
+  }
+  mapping.sanitisedFilenames[state.selectedFile] = outputSanitisedName;
   await saveMapping(c.rawHandle, mapping);
   const added = accumulateWatchlist(state.watchlist, mapping, c.id);
   if (added) await saveWatchlist(state.handles.root, state.watchlist);
@@ -4208,9 +4246,13 @@ async function onCopySanitisedBatch() {
     const [caseId, name] = key.split('::');
     const c = state.cases.find((x) => x.id === caseId);
     if (!c) { missing.push(key); continue; }
+    const fileObj = (c.files || []).find((f) => f.name === name) || {};
+    const sanName = fileObj.sanitisedName || name;
     try {
-      const { text } = await readFileText(c.sanHandle, name);
-      chunks.push(`\n\n===== ${caseId} / ${name} =====\n\n${text}`);
+      let text;
+      try { ({ text } = await readFileText(c.sanHandle, sanName)); }
+      catch (_e) { ({ text } = await readFileText(c.sanHandle, name)); }
+      chunks.push(`\n\n===== ${caseId} / ${sanName} =====\n\n${text}`);
     } catch (_e) {
       missing.push(key);
     }
@@ -4891,7 +4933,9 @@ async function onExtractExistingFile(caseObj, name) {
  * removing them would silently break rehydration of those.
  */
 async function onDeleteFile(caseObj, name) {
-  const hasSanitised = (caseObj.files.find((f) => f.name === name) || {}).hasSanitised;
+  const fileObj = caseObj.files.find((f) => f.name === name) || {};
+  const hasSanitised = fileObj.hasSanitised;
+  const sanName = fileObj.sanitisedName || name;
   const proceed = confirm(
     `Delete "${name}" from case ${caseObj.id}?\n\n`
     + `This removes the raw copy${hasSanitised ? ' and the sanitised copy' : ''}. `
@@ -4902,8 +4946,20 @@ async function onDeleteFile(caseObj, name) {
   try {
     await deleteEntry(caseObj.rawHandle, name);
     if (hasSanitised) {
-      try { await deleteEntry(caseObj.sanHandle, name); } catch (_e) { /* mirror already missing */ }
+      try { await deleteEntry(caseObj.sanHandle, sanName); } catch (_e) { /* mirror already missing */ }
+      if (sanName !== name) {
+        try { await deleteEntry(caseObj.sanHandle, name); } catch (_e) { /* nothing to sweep */ }
+      }
     }
+    // Also remove the sanitised-name entry from the mapping so a
+    // re-added file does not inherit the stale pairing.
+    try {
+      const mapping = await loadMapping(caseObj.rawHandle, caseObj.id);
+      if (mapping.sanitisedFilenames && mapping.sanitisedFilenames[name]) {
+        delete mapping.sanitisedFilenames[name];
+        await saveMapping(caseObj.rawHandle, mapping);
+      }
+    } catch (_e) { /* no mapping yet */ }
     await appendAudit(caseObj.rawHandle, `Deleted file: ${name}${hasSanitised ? ' (raw and sanitised)' : ' (raw only)'}`);
     if (state.selectedFile === name && state.selectedCaseId === caseObj.id) {
       state.selectedFile = null;
