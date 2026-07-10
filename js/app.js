@@ -825,7 +825,7 @@ function ensureOrtWasmBlobUrl() {
  * mapped to name_possible; LOC to address_line; ORG is treated as a
  * name_possible so it flows through the review as a judgement call.
  */
-async function runNerOnText(text) {
+async function runNerOnText(text, mapping) {
   const pipe = state.nerPipeline;
   if (!pipe) return [];
   const chunks = chunkTextForNer(text, 1500);
@@ -835,14 +835,22 @@ async function runNerOnText(text) {
     for (const r of raw) {
       const category = mapNerLabel(r.entity_group || r.entity);
       if (!category) continue;
+      if (r.start == null || r.end == null || r.end <= r.start) continue;
       const start = chunk.offset + r.start;
       const end = chunk.offset + r.end;
+      if (start < 0 || end > text.length) continue;
+      const spanText = text.slice(start, end);
+      if (!spanText.trim()) continue;
+      const known = mapping ? findByOriginal(mapping, spanText) : null;
       out.push({
         start,
         end,
-        text: text.slice(start, end),
+        text: spanText,
         category,
         source: 'ner',
+        known: known ? { token: known.token, category: known.category } : null,
+        contextBefore: text.slice(Math.max(0, start - 30), start),
+        contextAfter: text.slice(end, Math.min(text.length, end + 30)),
       });
     }
   }
@@ -1133,7 +1141,9 @@ function detectEntities(text, mapping, safeSet) {
     chosen.push(s);
     cursor = s.end;
   }
-  return chosen.map((s) => decorateWithMapping(s, mapping, text));
+  return chosen
+    .filter((s) => (s.text || '').trim().length > 0 && s.end > s.start)
+    .map((s) => decorateWithMapping(s, mapping, text));
 }
 
 /**
@@ -1877,14 +1887,18 @@ function openReviewDialog(entities, mapping, options = {}) {
         const role = ev.target.dataset && ev.target.dataset.role;
         if (role === 'safe-case' || role === 'safe-global') {
           const scope = role === 'safe-global' ? 'global' : 'case';
-          const text = decisions[idx].text.trim();
-          if (!text) { return; }
-          if (!safeListUpdates.some((u) => u.text.toLowerCase() === text.toLowerCase() && u.scope === scope)) {
+          const text = (decisions[idx].text || '').trim();
+          // Empty-text rows can still be dismissed via Safe: mark them
+          // preserve so they don't block save. Only push to the actual
+          // safe list when there is real text to record.
+          if (text && !safeListUpdates.some((u) => u.text.toLowerCase() === text.toLowerCase() && u.scope === scope)) {
             safeListUpdates.push({ text, scope });
           }
           decisions[idx].action = 'preserve';
+          decisions[idx].textInvalid = false;
           refreshRow(rowEl, decisions[idx]);
           markSafeChip(rowEl, scope);
+          markInvalidText(rowEl, false);
           updateSummary(modal, decisions);
           return;
         }
@@ -2148,6 +2162,7 @@ function refreshRow(rowEl, decision) {
 }
 
 function isUnresolved(d) {
+  if (!(d.text || '').trim()) return false;
   if (d.action === 'unresolved') return true;
   if (d.action === 'tokenise' && !d.token) return true;
   return false;
@@ -2893,7 +2908,7 @@ async function onSanitise() {
   if (state.globalSettings.nerEnabled && state.nerPipeline) {
     try {
       updateNerStatus('running');
-      const nerSpans = (await runNerOnText(state.currentText))
+      const nerSpans = (await runNerOnText(state.currentText, mapping))
         .filter((s) => !safeSet.has((s.text || '').toLowerCase().trim()));
       mergedEntities = mergeNerSpans(rawEntities, nerSpans);
       updateNerStatus('ready');
