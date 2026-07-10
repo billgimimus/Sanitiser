@@ -45,6 +45,15 @@ Built:
 - Binary heuristic fallback for files with unfamiliar extensions: if the first kilobyte contains more than 5% control characters (excluding tab, CR, LF), the file is treated as unsupported.
 - Audit log now records paste-text events with the optional source note.
 
+## Phase 2.3: passive cross-case conflict banner
+
+Introduce a cross-case watchlist at the casework root (`_watchlist.json`). Every real identifier tokenised in any case, open or closed, is appended to the watchlist after a successful sanitisation. On the next sanitisation of a different case, detected entities are cross-checked against the watchlist.
+
+- Match strength is graded lightly: hard for addresses, postcodes, emails, phone, NI/NHS/BRP/passport; medium for name-only; soft for everything else. This is data recorded on each watchlist entry; the review banner does not yet gate on strength.
+- When any detected identifier has been seen in another case, the review dialog opens with a top-of-body banner naming the count and the case IDs involved. Each affected row also carries a small "seen in N other case" chip so the adviser can find them in the table.
+- Same-case matches are suppressed. The banner is passive, not a determination of conflict; Shelter's substantive conflict-handling process still governs the actual decision.
+- Watchlist additions are recorded in the case audit log alongside the sanitisation event.
+
 ## Phase 2.2: verbatim block handling for CRM referral notes
 
 Housing casework has a specific rule that the referral narrative in the CRM entry must reproduce the referral form byte-for-byte. To enforce this when the AI is drafting the CRM entry:

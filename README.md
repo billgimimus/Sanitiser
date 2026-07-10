@@ -23,6 +23,12 @@ If the page shows a red banner saying the tool did not start, one of two things 
 
 Hover over a file in the sidebar to reveal a small × on the right. Clicking it prompts for confirmation, then removes the raw file and, if there is one, the sanitised mirror. The open file view also has a **Delete file** button styled in red. The case mapping is left intact so tokens already used elsewhere in the case still resolve.
 
+## Cross-case conflict banner
+
+Every real identifier the tool tokenises in any case is recorded in a `_watchlist.json` file at the casework root. When you next sanitise a file in a different case, the review dialog opens with a banner naming any identifiers that have appeared in other cases and which case IDs they came from. Individual rows carry a "seen in N other case" chip too so you can find them in the table.
+
+This is a passive trigger, not a determination of conflict. Shelter's substantive conflict-handling process still governs the actual decision. The banner exists so you don't miss the flag; the outcome is yours.
+
 ## Verbatim block handling
 
 Housing casework has a specific rule for CRM referral notes: the narrative must be reproduced from the referral form byte-for-byte. To enforce that when the AI is drafting the CRM entry, wrap the section in `<verbatim>` tags in the source file, for example inside a paste-text file:

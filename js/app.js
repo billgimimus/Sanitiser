@@ -685,6 +685,86 @@ async function saveGlobalSettings(rootHandle, settings) {
   await writeJSON(rootHandle, SETTINGS_FILENAME, settings);
 }
 
+/**
+ * Cross-case watchlist of every identifier ever tokenised in any case,
+ * open or closed. Stored at the casework root as _watchlist.json so
+ * both active and closed cases contribute. Each entry:
+ *   { normalised, original, category, caseId, addedAt, matchStrength }
+ * `normalised` is a lowercased comparison key. `matchStrength` is the
+ * lightweight grading the spec defines: hard (address / postcode+name /
+ * email / phone), medium (name only), soft (indirect combinations).
+ */
+const WATCHLIST_FILENAME = '_watchlist.json';
+
+async function loadWatchlist(rootHandle) {
+  const existing = await readJSON(rootHandle, WATCHLIST_FILENAME);
+  if (existing && existing.version === 1) {
+    if (!Array.isArray(existing.entries)) existing.entries = [];
+    return existing;
+  }
+  return { version: 1, entries: [] };
+}
+
+async function saveWatchlist(rootHandle, watchlist) {
+  await writeJSON(rootHandle, WATCHLIST_FILENAME, watchlist);
+}
+
+function watchlistMatchStrength(category) {
+  if (['email', 'phone', 'address_line', 'postcode_full', 'ni_number', 'nhs_number', 'brp', 'passport'].includes(category)) return 'hard';
+  if (category === 'name_possible') return 'medium';
+  return 'soft';
+}
+
+/**
+ * Append every unique mapping entry (excluding those already seen for
+ * this case) to the watchlist. Called after a successful sanitisation
+ * so that closed cases still contribute forever.
+ */
+function accumulateWatchlist(watchlist, mapping, caseId) {
+  const seen = new Set(
+    watchlist.entries
+      .filter((e) => e.caseId === caseId)
+      .map((e) => `${e.normalised}|${e.category}`)
+  );
+  let added = 0;
+  for (const e of mapping.entries) {
+    const key = `${e.original.toLowerCase().trim()}|${e.category}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    watchlist.entries.push({
+      normalised: e.original.toLowerCase().trim(),
+      original: e.original,
+      category: e.category,
+      caseId,
+      addedAt: new Date().toISOString(),
+      matchStrength: watchlistMatchStrength(e.category),
+    });
+    added++;
+  }
+  return added;
+}
+
+/**
+ * For each detected entity, list any prior appearances in other cases.
+ * Same-case appearances are suppressed so the banner doesn't count the
+ * adviser's own history against them.
+ */
+function crossCheckWatchlist(entities, watchlist, currentCaseId) {
+  const byKey = new Map();
+  for (const entry of watchlist.entries || []) {
+    if (entry.caseId === currentCaseId) continue;
+    const arr = byKey.get(entry.normalised) || [];
+    arr.push(entry);
+    byKey.set(entry.normalised, arr);
+  }
+  return entities.map((e) => {
+    const key = (e.text || '').toLowerCase().trim();
+    const hits = byKey.get(key);
+    if (!hits || !hits.length) return e;
+    return { ...e, priorAppearances: hits };
+  });
+}
+
 async function saveMapping(rawHandle, mapping) {
   await writeJSON(rawHandle, MAPPING_FILENAME, mapping);
 }
@@ -1588,6 +1668,7 @@ function openReviewDialog(entities, mapping, options = {}) {
     modal.innerHTML = `
       <div class="modal-header">Review detected entities: ${escapeHtml(options.title || 'file')}</div>
       <div class="modal-body">
+        ${renderPriorAppearanceBanner(options.priorSummary)}
         <p class="muted">The detected text on the left is editable, so you can trim a wrongly captured boundary (for example changing "Hi Kieran" to "Kieran"). Use "Safe here" or "Safe everywhere" to record that a specific string should be skipped by future detection.</p>
         <div id="review-summary" class="muted" style="margin-bottom:8px"></div>
         <table class="entity-table">
@@ -1714,6 +1795,27 @@ function repositionSpan(decision, newText, documentText) {
   return true;
 }
 
+/**
+ * Render the top-of-review banner listing prior appearances of any
+ * detected identifier in other cases. Silent when there are none.
+ * Deliberately lightweight: this is a passive trigger, not a formal
+ * conflicts policy. Shelter's substantive conflict rules govern the
+ * actual decision.
+ */
+function renderPriorAppearanceBanner(summary) {
+  if (!summary) return '';
+  const rows = summary.cases.map((c) => {
+    const items = c.items.map((it) => `<span class="chip">${escapeHtml(it.text)}</span>`).join(' ');
+    return `<li><strong>${escapeHtml(c.caseId)}</strong>: ${items}</li>`;
+  }).join('');
+  return `
+    <div class="integrity-block">
+      <strong>${summary.totalIdentifiers} identifier${summary.totalIdentifiers === 1 ? '' : 's'} previously seen in ${summary.cases.length} other case${summary.cases.length === 1 ? '' : 's'}.</strong>
+      This is a passive trigger, not a determination of conflict. Review before proceeding, and follow Shelter's substantive conflict-handling process if a real conflict is confirmed.
+      <ul>${rows}</ul>
+    </div>`;
+}
+
 function updateContextDisplay(rowEl, decision) {
   const el = rowEl.querySelector('[data-role="context"]');
   if (el) {
@@ -1771,6 +1873,10 @@ function renderRow(decision, idx) {
   tr.dataset.idx = String(idx);
   const catLabel = CATEGORY_LABELS[decision.category] || decision.category;
   const flag = JUDGEMENT_CATEGORIES.has(decision.category) ? '<span class="chip flag">review</span>' : '';
+  const priorHits = decision.priorAppearances && decision.priorAppearances.length;
+  const priorChip = priorHits
+    ? `<span class="chip flag" title="${escapeHtml('Prior appearances: ' + decision.priorAppearances.map((p) => p.caseId).join(', '))}">seen in ${priorHits} other case${priorHits === 1 ? '' : 's'}</span>`
+    : '';
   tr.innerHTML = `
     <td>
       <input class="entity-original" style="width:100%;font-family:var(--mono);font-size:12px;padding:4px 6px;" data-role="span-text" type="text" value="${escapeHtml(decision.text)}">
@@ -1782,7 +1888,7 @@ function renderRow(decision, idx) {
         <span class="chip flag" data-role="edit-status" hidden>Edited text not found in the document</span>
       </div>
     </td>
-    <td>${flag}<span class="entity-category">${escapeHtml(catLabel)}</span></td>
+    <td>${flag}${priorChip}<span class="entity-category">${escapeHtml(catLabel)}</span></td>
     <td>${renderActionSelect(decision)}</td>
     <td>${renderTokenControl(decision)}</td>
   `;
@@ -2008,6 +2114,7 @@ const state = {
   currentOriginalMtime: null,
   currentMapping: null,
   globalSettings: { version: 1, safeList: [] },
+  watchlist: { version: 1, entries: [] },
 };
 
 document.addEventListener('DOMContentLoaded', init);
@@ -2037,6 +2144,7 @@ async function onOpenRoot() {
   try {
     state.handles = await pickRoot();
     state.globalSettings = await loadGlobalSettings(state.handles.root);
+    state.watchlist = await loadWatchlist(state.handles.root);
     document.getElementById('root-path').textContent = 'Casework folder ready';
     await refreshCases();
   } catch (err) {
@@ -2420,10 +2528,13 @@ async function onSanitise() {
   if (!c || !state.selectedFile) return;
   const mapping = state.currentMapping;
   const safeSet = buildSafeSet(mapping.safeList, state.globalSettings.safeList);
-  const entities = detectEntities(state.currentText, mapping, safeSet);
+  const rawEntities = detectEntities(state.currentText, mapping, safeSet);
+  const entities = crossCheckWatchlist(rawEntities, state.watchlist, c.id);
+  const priorSummary = summarisePriorAppearances(entities);
   const result = await openReviewDialog(entities, mapping, {
     title: state.selectedFile,
     documentText: state.currentText,
+    priorSummary,
   });
   if (!result) return;
   for (const upd of result.mappingUpdates) {
@@ -2456,11 +2567,36 @@ async function onSanitise() {
   const output = header + sanitised;
   await writeFileText(c.sanHandle, state.selectedFile, output);
   await saveMapping(c.rawHandle, mapping);
+  const added = accumulateWatchlist(state.watchlist, mapping, c.id);
+  if (added) await saveWatchlist(state.handles.root, state.watchlist);
   const verbatimAudit = verbatimIds.length ? `; ${verbatimIds.length} verbatim block(s)` : '';
-  await appendAudit(c.rawHandle, `Sanitised: ${state.selectedFile} (${result.decisions.length} decisions, ${result.mappingUpdates.length} new mapping entries)${safeAudit ? `; ${safeAudit}` : ''}${verbatimAudit}`);
+  const watchlistAudit = added ? `; ${added} new watchlist entrie(s)` : '';
+  await appendAudit(c.rawHandle, `Sanitised: ${state.selectedFile} (${result.decisions.length} decisions, ${result.mappingUpdates.length} new mapping entries)${safeAudit ? `; ${safeAudit}` : ''}${verbatimAudit}${watchlistAudit}`);
   state.currentMapping = mapping;
   await selectFile(state.selectedFile);
   showToast(verbatimIds.length ? `Sanitised file written with ${verbatimIds.length} verbatim block(s).` : 'Sanitised file written.');
+}
+
+/**
+ * Reduce the per-entity prior-appearance data to a small summary the
+ * review dialog can render as a single banner without cluttering the
+ * table. Returns null if no prior appearances were found.
+ */
+function summarisePriorAppearances(entities) {
+  const flagged = entities.filter((e) => e.priorAppearances && e.priorAppearances.length);
+  if (!flagged.length) return null;
+  const perCase = new Map();
+  for (const e of flagged) {
+    for (const p of e.priorAppearances) {
+      const list = perCase.get(p.caseId) || [];
+      list.push({ text: e.text, category: e.category, strength: p.matchStrength });
+      perCase.set(p.caseId, list);
+    }
+  }
+  return {
+    totalIdentifiers: flagged.length,
+    cases: Array.from(perCase.entries()).map(([caseId, items]) => ({ caseId, items })),
+  };
 }
 
 /**
