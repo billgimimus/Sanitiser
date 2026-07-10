@@ -19,6 +19,10 @@ If the page shows a red banner saying the tool did not start, one of two things 
 3. Drag one or more files onto the case row in the sidebar to add them to the case.
 4. Click a file to open it. The Original tab shows the raw text; the Sanitised tab shows the tokenised copy once you sanitise it.
 
+## Deleting a file
+
+Hover over a file in the sidebar to reveal a small × on the right. Clicking it prompts for confirmation, then removes the raw file and, if there is one, the sanitised mirror. The open file view also has a **Delete file** button styled in red. The case mapping is left intact so tokens already used elsewhere in the case still resolve.
+
 ## Emails, PDFs, and other formats the tool cannot yet parse
 
 Phase 1 only handles plain-text files (`.txt`, `.md`, and other UTF-8 readable content). Outlook `.msg` files, PDFs, `.docx`, and images are added in phase 2. For now, when you open a file the tool cannot read, you get a clear message rather than garbled bytes.

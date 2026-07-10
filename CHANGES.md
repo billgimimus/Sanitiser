@@ -45,6 +45,13 @@ Built:
 - Binary heuristic fallback for files with unfamiliar extensions: if the first kilobyte contains more than 5% control characters (excluding tab, CR, LF), the file is treated as unsupported.
 - Audit log now records paste-text events with the optional source note.
 
+## Phase 1.3: delete file
+
+- Every file in the sidebar shows a small × on hover. Clicking it prompts for confirmation, then removes the raw copy and the sanitised mirror if one exists.
+- The file view header has a **Delete file** button styled in the same danger colour, for the currently open file.
+- The case mapping is intentionally left alone on delete: tokens already assigned may still be referenced by other files in the case, and removing them would silently break rehydration of those.
+- Audit log records the deletion, noting whether the sanitised mirror was present.
+
 ## Phase 1.2: editable spans, safe lists, and more stopwords
 
 Prompted by feedback that "Hi Kieran" was being picked up as a name when only "Kieran" was the name, and that there was no way to teach the tool about names that are known-safe:

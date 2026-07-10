@@ -1678,6 +1678,7 @@ function init() {
   document.getElementById('btn-sanitise').addEventListener('click', onSanitise);
   document.getElementById('btn-copy-sanitised').addEventListener('click', onCopySanitised);
   document.getElementById('btn-resanitise').addEventListener('click', onSanitise);
+  document.getElementById('btn-delete-file').addEventListener('click', onDeleteOpenFile);
   document.querySelectorAll('#file-view .tabs .tab').forEach((btn) => {
     btn.addEventListener('click', () => switchFileTab(btn.dataset.tab));
   });
@@ -1732,8 +1733,13 @@ function renderSidebar() {
         const fitem = document.createElement('div');
         fitem.className = 'file-item' + (state.selectedFile === f.name ? ' selected' : '');
         const badge = f.hasSanitised ? '<span class="file-badge done">sanitised</span>' : '<span class="file-badge">raw</span>';
-        fitem.innerHTML = `<span>${escapeHtml(f.name)}</span>${badge}`;
+        fitem.innerHTML = `<span class="file-item-name">${escapeHtml(f.name)}</span><span class="file-item-right">${badge}<button class="file-item-del" data-role="delete" title="Delete this file from the case" type="button">×</button></span>`;
         fitem.addEventListener('click', (ev) => {
+          if (ev.target.dataset && ev.target.dataset.role === 'delete') {
+            ev.stopPropagation();
+            onDeleteFile(c, f.name);
+            return;
+          }
           ev.stopPropagation();
           selectFile(f.name);
         });
@@ -2214,6 +2220,45 @@ async function onNewCase() {
   } catch (err) {
     showToast(`Could not create case: ${err.message}`, true);
   }
+}
+
+/**
+ * Delete a file from a case. Removes the raw copy and, if present, the
+ * sanitised mirror. The case mapping is left alone: tokens already
+ * allocated may still be referenced by other files in the case, and
+ * removing them would silently break rehydration of those.
+ */
+async function onDeleteFile(caseObj, name) {
+  const hasSanitised = (caseObj.files.find((f) => f.name === name) || {}).hasSanitised;
+  const proceed = confirm(
+    `Delete "${name}" from case ${caseObj.id}?\n\n`
+    + `This removes the raw copy${hasSanitised ? ' and the sanitised copy' : ''}. `
+    + 'The case mapping is not changed, so any tokens already assigned still work in other files. '
+    + 'This cannot be undone from the tool.'
+  );
+  if (!proceed) return;
+  try {
+    await deleteEntry(caseObj.rawHandle, name);
+    if (hasSanitised) {
+      try { await deleteEntry(caseObj.sanHandle, name); } catch (_e) { /* mirror already missing */ }
+    }
+    await appendAudit(caseObj.rawHandle, `Deleted file: ${name}${hasSanitised ? ' (raw and sanitised)' : ' (raw only)'}`);
+    if (state.selectedFile === name && state.selectedCaseId === caseObj.id) {
+      state.selectedFile = null;
+      hideFileView();
+    }
+    await refreshCases();
+    showToast(`Deleted ${name}.`);
+  } catch (err) {
+    showToast(`Could not delete: ${err.message}`, true);
+  }
+}
+
+async function onDeleteOpenFile() {
+  if (!state.selectedFile) return;
+  const c = state.cases.find((x) => x.id === state.selectedCaseId);
+  if (!c) return;
+  await onDeleteFile(c, state.selectedFile);
 }
 
 async function onCloseCase(caseObj) {

@@ -140,6 +140,41 @@ html, body {
   background: #e2eaf2;
 }
 
+.file-item-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.file-item-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.file-item-del {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1;
+  padding: 2px 6px;
+  cursor: pointer;
+  border-radius: 3px;
+  opacity: 0;
+}
+
+.file-item:hover .file-item-del {
+  opacity: 1;
+}
+
+.file-item-del:hover {
+  background: var(--error-bg);
+  color: var(--error-text);
+}
+
 .file-item .file-badge {
   font-size: 11px;
   padding: 1px 6px;
