@@ -23,6 +23,25 @@ If the page shows a red banner saying the tool did not start, one of two things 
 
 Hover over a file in the sidebar to reveal a small × on the right. Clicking it prompts for confirmation, then removes the raw file and, if there is one, the sanitised mirror. The open file view also has a **Delete file** button styled in red. The case mapping is left intact so tokens already used elsewhere in the case still resolve.
 
+## Verbatim block handling
+
+Housing casework has a specific rule for CRM referral notes: the narrative must be reproduced from the referral form byte-for-byte. To enforce that when the AI is drafting the CRM entry, wrap the section in `<verbatim>` tags in the source file, for example inside a paste-text file:
+
+```
+Referral form
+...
+
+<verbatim>
+[the referral narrative that must not be paraphrased]
+</verbatim>
+
+...
+```
+
+On sanitisation, each block is rewritten into the sanitised output as `<verbatim-referral id="v_...">...</verbatim-referral>` with the exact raw content recorded in `_mapping.json`. The header block on the sanitised file names the count, so you can prompt the AI: "reproduce anything inside `<verbatim-referral>` tags exactly."
+
+On rehydration, the tool finds each `<verbatim-referral>` block in the AI's reply, rehydrates it with real identifiers, and compares it byte-for-byte against the stored original. If a block differs, a dialog opens showing the expected and actual side by side. The rehydrated text is not put on the clipboard until the adviser explicitly overrides or fixes the mismatch. Whichever the adviser chooses, the audit log records it. Successful blocks have the marker tags stripped so what reaches the clipboard is client-facing text.
+
 ## Emails
 
 Drop one or more `.eml` files onto a case in the sidebar and the tool parses them and saves each as a plain-text file inside the case, named after the source (`meeting.eml` becomes `meeting.txt`). If a file with that name already exists, a suffix is added.

@@ -957,7 +957,7 @@ function applySanitisation(text, decisions) {
   return out;
 }
 
-function buildHeader({ caseId, sourceName, tokensUsed, sanitisedDateISO }) {
+function buildHeader({ caseId, sourceName, tokensUsed, sanitisedDateISO, verbatimCount }) {
   const uniqueTokens = Array.from(new Set(tokensUsed)).sort();
   const dateLabel = formatDate(sanitisedDateISO);
   const lines = [
@@ -966,10 +966,11 @@ function buildHeader({ caseId, sourceName, tokensUsed, sanitisedDateISO }) {
     `# Source: ${sourceName}`,
     `# Sanitised: ${dateLabel}`,
     `# Tokens: ${uniqueTokens.join(' ') || '(none)'}`,
-    '# This block must be removed before use in client-facing systems.',
-    HEADER_END,
-    '',
   ];
+  if (verbatimCount) {
+    lines.push(`# Verbatim blocks: ${verbatimCount} (must be reproduced without alteration between <verbatim-referral> tags)`);
+  }
+  lines.push('# This block must be removed before use in client-facing systems.', HEADER_END, '');
   return lines.join('\n');
 }
 
@@ -1097,9 +1098,101 @@ function forwardReplace(text, mapping) {
  */
 function rehydrate(text, mapping) {
   const withoutHeader = stripHeader(text);
-  const hits = reverseCheck(withoutHeader, mapping);
-  const replaced = forwardReplace(withoutHeader, mapping);
-  return { hits, replaced, cleaned: withoutHeader };
+  const { text: withoutVerbatim, mismatches: verbatimMismatches } = verifyAndStripVerbatimBlocks(withoutHeader, mapping);
+  const hits = reverseCheck(withoutVerbatim, mapping);
+  const replaced = forwardReplace(withoutVerbatim, mapping);
+  return { hits, replaced, cleaned: withoutVerbatim, verbatimMismatches };
+}
+
+// =====================================================================
+// verbatim blocks: enforce byte-for-byte reproduction of referral notes
+// =====================================================================
+
+/**
+ * Scan a raw source text for author-marked verbatim regions written as
+ *   <verbatim> ... </verbatim>
+ * and return the spans plus the raw content between the tags. Used
+ * before sanitisation so we can wrap the tokenised output in the
+ * <verbatim-referral id="..."> markers Claude sees.
+ */
+function extractVerbatimSpans(text) {
+  const rx = /<verbatim>([\s\S]*?)<\/verbatim>/g;
+  const out = [];
+  let m;
+  while ((m = rx.exec(text)) !== null) {
+    out.push({
+      openStart: m.index,
+      contentStart: m.index + '<verbatim>'.length,
+      contentEnd: m.index + m[0].length - '</verbatim>'.length,
+      closeEnd: m.index + m[0].length,
+      raw: m[1],
+    });
+  }
+  return out;
+}
+
+/**
+ * After applySanitisation has produced the sanitised body, replace each
+ * `<verbatim>...</verbatim>` block in that body with
+ * `<verbatim-referral id="vN">...</verbatim-referral>` and remember the
+ * raw content of each block on the mapping. The Nth block in the source
+ * maps to the Nth block in the sanitised text because the marker tags
+ * are byte-preserved by applySanitisation.
+ */
+function rewriteVerbatimBlocks(rawText, sanitisedText, mapping) {
+  const rawSpans = extractVerbatimSpans(rawText);
+  if (!rawSpans.length) return { sanitised: sanitisedText, ids: [] };
+  const sanSpans = extractVerbatimSpans(sanitisedText);
+  if (sanSpans.length !== rawSpans.length) {
+    throw new Error('Verbatim marker count changed during sanitisation. Aborting to avoid mis-pairing.');
+  }
+  if (!Array.isArray(mapping.verbatimBlocks)) mapping.verbatimBlocks = [];
+  const stamp = Date.now();
+  const ids = [];
+  let out = '';
+  let cursor = 0;
+  sanSpans.forEach((s, i) => {
+    const id = `v_${stamp}_${i + 1}`;
+    ids.push(id);
+    out += sanitisedText.slice(cursor, s.openStart);
+    out += `<verbatim-referral id="${id}">`;
+    out += sanitisedText.slice(s.contentStart, s.contentEnd);
+    out += '</verbatim-referral>';
+    cursor = s.closeEnd;
+    mapping.verbatimBlocks.push({
+      id,
+      originalContent: rawSpans[i].raw,
+      sanitisedContent: sanitisedText.slice(s.contentStart, s.contentEnd),
+      createdAt: new Date().toISOString(),
+    });
+  });
+  out += sanitisedText.slice(cursor);
+  return { sanitised: out, ids };
+}
+
+/**
+ * On rehydration, find every `<verbatim-referral id="X">...</verbatim-referral>`
+ * block in the pasted AI reply, rehydrate the content, and compare it
+ * byte-for-byte with the originalContent recorded when the sanitised
+ * file was written. Mismatches are returned; the tags themselves are
+ * stripped from the output either way so client-facing paste never
+ * carries the marker syntax.
+ */
+function verifyAndStripVerbatimBlocks(text, mapping) {
+  const rx = /<verbatim-referral\s+id="([^"]+)">([\s\S]*?)<\/verbatim-referral>/g;
+  const mismatches = [];
+  const records = (mapping && mapping.verbatimBlocks) || [];
+  const replaced = text.replace(rx, (_m, id, content) => {
+    const rehydratedInside = forwardReplace(content, mapping);
+    const record = records.find((r) => r.id === id);
+    if (!record) {
+      mismatches.push({ id, reason: 'unknown block id', actual: rehydratedInside, expected: null });
+    } else if (rehydratedInside !== record.originalContent) {
+      mismatches.push({ id, reason: 'content differs', actual: rehydratedInside, expected: record.originalContent });
+    }
+    return rehydratedInside;
+  });
+  return { text: replaced, mismatches };
 }
 
 function buildLiteralRegex(str) {
@@ -2337,7 +2430,17 @@ async function onSanitise() {
     if (upd.aliasFor) addAlias(mapping, upd.aliasFor, upd.alias);
   }
   const safeAudit = await persistSafeListUpdates(mapping, result.safeListUpdates || []);
-  const sanitised = applySanitisation(state.currentText, result.decisions);
+  const sanitisedRaw = applySanitisation(state.currentText, result.decisions);
+  let sanitised;
+  let verbatimIds = [];
+  try {
+    const rewritten = rewriteVerbatimBlocks(state.currentText, sanitisedRaw, mapping);
+    sanitised = rewritten.sanitised;
+    verbatimIds = rewritten.ids;
+  } catch (err) {
+    showToast(`Verbatim rewrite failed: ${err.message}`, true);
+    return;
+  }
   const offenders = checkOutgoing(sanitised, mapping);
   if (offenders.length) {
     showToast(`Sanitisation blocked. ${offenders.length} real identifier${offenders.length === 1 ? '' : 's'} still present: ${offenders.map((o) => o.original).join(', ')}`, true);
@@ -2348,14 +2451,16 @@ async function onSanitise() {
     sourceName: state.selectedFile,
     tokensUsed: result.decisions.filter((d) => d.action === 'tokenise').map((d) => d.token),
     sanitisedDateISO: new Date().toISOString(),
+    verbatimCount: verbatimIds.length,
   });
   const output = header + sanitised;
   await writeFileText(c.sanHandle, state.selectedFile, output);
   await saveMapping(c.rawHandle, mapping);
-  await appendAudit(c.rawHandle, `Sanitised: ${state.selectedFile} (${result.decisions.length} decisions, ${result.mappingUpdates.length} new mapping entries)${safeAudit ? `; ${safeAudit}` : ''}`);
+  const verbatimAudit = verbatimIds.length ? `; ${verbatimIds.length} verbatim block(s)` : '';
+  await appendAudit(c.rawHandle, `Sanitised: ${state.selectedFile} (${result.decisions.length} decisions, ${result.mappingUpdates.length} new mapping entries)${safeAudit ? `; ${safeAudit}` : ''}${verbatimAudit}`);
   state.currentMapping = mapping;
   await selectFile(state.selectedFile);
-  showToast('Sanitised file written.');
+  showToast(verbatimIds.length ? `Sanitised file written with ${verbatimIds.length} verbatim block(s).` : 'Sanitised file written.');
 }
 
 /**
@@ -2408,18 +2513,81 @@ async function onPasteRehydrate() {
   try { text = await readText(); } catch (err) { showToast(err.message, true); return; }
   if (!text) { showToast('Clipboard is empty.', true); return; }
   const mapping = await loadMapping(c.rawHandle, c.id);
-  const { hits, replaced, cleaned } = rehydrate(text, mapping);
+  const { hits, replaced, cleaned, verbatimMismatches } = rehydrate(text, mapping);
+  if (verbatimMismatches && verbatimMismatches.length) {
+    const choice = await showVerbatimMismatchDialog(verbatimMismatches);
+    if (choice === 'abort') {
+      showToast('Rehydration aborted. Verbatim block mismatch left unresolved.', true);
+      return;
+    }
+    await appendAudit(c.rawHandle, `Verbatim mismatch acknowledged and overridden by adviser for ${verbatimMismatches.length} block(s).`);
+  }
   if (hits.length) {
     await showRehydrateIntegrityDialog(hits, replaced, cleaned, mapping);
     return;
   }
   try {
     await copyText(replaced, 'rehydrated text');
-    await appendAudit(c.rawHandle, `Rehydrated ${text.length} chars (${(text.match(/\[[A-Z_]+.*?\]/g) || []).length} tokens).`);
+    const mismatchNote = verbatimMismatches && verbatimMismatches.length ? `; ${verbatimMismatches.length} verbatim mismatch(es) overridden` : '';
+    await appendAudit(c.rawHandle, `Rehydrated ${text.length} chars (${(text.match(/\[[A-Z_]+.*?\]/g) || []).length} tokens)${mismatchNote}.`);
     showToast('Rehydrated text copied. Paste into Outlook or CRM.');
   } catch (err) {
     showToast(err.message, true);
   }
+}
+
+/**
+ * Present verbatim byte-match failures to the adviser and let them
+ * decide whether to abort or override. Overriding does not "fix" the
+ * mismatch: it simply lets the (potentially altered) block through
+ * after the adviser has read what changed. The audit log records the
+ * override.
+ */
+function showVerbatimMismatchDialog(mismatches) {
+  return new Promise((resolve) => {
+    const root = document.getElementById('dialog-root');
+    root.innerHTML = '';
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop';
+    const modal = document.createElement('div');
+    modal.className = 'modal';
+    modal.style.width = '820px';
+    backdrop.appendChild(modal);
+    const rows = mismatches.map((mm) => `
+      <div style="margin-bottom:16px;">
+        <div class="entity-category">Block id: ${escapeHtml(mm.id)} - ${escapeHtml(mm.reason)}</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:4px;">
+          <div>
+            <div class="entity-category">Original (in mapping)</div>
+            <pre style="border:1px solid var(--border);padding:6px;font-size:12px;white-space:pre-wrap;max-height:220px;overflow:auto;">${escapeHtml(mm.expected == null ? '(no record of this id in the mapping)' : mm.expected)}</pre>
+          </div>
+          <div>
+            <div class="entity-category">Rehydrated from AI reply</div>
+            <pre style="border:1px solid var(--border);padding:6px;font-size:12px;white-space:pre-wrap;max-height:220px;overflow:auto;">${escapeHtml(mm.actual)}</pre>
+          </div>
+        </div>
+      </div>
+    `).join('');
+    modal.innerHTML = `
+      <div class="modal-header">Verbatim block byte-match failed</div>
+      <div class="modal-body">
+        <p>The AI's response should have reproduced the following block(s) exactly. Any difference blocks the paste-to-CRM step so the referral note stays byte-identical to the referral form. Review each pair below.</p>
+        ${rows}
+      </div>
+      <div class="modal-footer">
+        <button class="danger" data-action="abort">Abort rehydration</button>
+        <button data-action="override">Override and continue</button>
+      </div>
+    `;
+    modal.addEventListener('click', (ev) => {
+      const a = ev.target.dataset && ev.target.dataset.action;
+      if (a === 'abort' || a === 'override') {
+        backdrop.remove();
+        resolve(a);
+      }
+    });
+    root.appendChild(backdrop);
+  });
 }
 
 function showRehydrateIntegrityDialog(hits, replaced, cleaned, mapping) {

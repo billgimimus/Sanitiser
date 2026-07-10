@@ -45,6 +45,16 @@ Built:
 - Binary heuristic fallback for files with unfamiliar extensions: if the first kilobyte contains more than 5% control characters (excluding tab, CR, LF), the file is treated as unsupported.
 - Audit log now records paste-text events with the optional source note.
 
+## Phase 2.2: verbatim block handling for CRM referral notes
+
+Housing casework has a specific rule that the referral narrative in the CRM entry must reproduce the referral form byte-for-byte. To enforce this when the AI is drafting the CRM entry:
+
+- Source text wrapped in `<verbatim>...</verbatim>` markers by the adviser (typed directly, or included when using paste-text as new file).
+- On sanitisation, each block is rewritten in the sanitised output as `<verbatim-referral id="v_TIMESTAMP_N">...</verbatim-referral>` and the exact raw content is recorded in `_mapping.json` under a new `verbatimBlocks` array. The N-th block in the source pairs with the N-th block in the sanitised output because the marker tags survive `applySanitisation` untouched.
+- The sanitised file's header block names the count so the adviser can prompt the AI accordingly.
+- On rehydration, `<verbatim-referral>` blocks are found in the AI reply, rehydrated with real identifiers, and compared byte-for-byte against the recorded original. If a block differs, a dialog shows the expected and actual side by side. The rehydrated text does not reach the clipboard until the adviser explicitly overrides or aborts. Both outcomes are recorded in the audit log.
+- Successful blocks have the marker tags stripped from the final output so what reaches the clipboard is client-facing text.
+
 ## Phase 2.1: .eml drag-drop with inline parser
 
 First feature of phase 2. Drop one or more `.eml` files onto a case row and the tool now:
