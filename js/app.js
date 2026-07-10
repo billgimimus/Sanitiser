@@ -3263,7 +3263,13 @@ async function selectFile(name) {
     state.currentMapping = await loadMapping(c.rawHandle, c.id);
     let sanitisedText = null;
     const fileObj = (c.files || []).find((f) => f.name === name);
-    const sanName = (fileObj && fileObj.sanitisedName) || (state.currentMapping.sanitisedFilenames || {})[name] || name;
+    // Mapping is authoritative: after a re-sanitise the raw filename may
+    // resolve to a different safe form, but the in-memory `c.files` entry
+    // still carries the previous scan's `sanitisedName`. Prefer the fresh
+    // mapping and fall back to the stale file entry only if the mapping
+    // doesn't remember this raw file yet.
+    const filemap = (state.currentMapping.sanitisedFilenames || {});
+    const sanName = filemap[name] || (fileObj && fileObj.sanitisedName) || name;
     try {
       const { text: sText, lastModified: sMtime } = await readFileText(c.sanHandle, sanName);
       sanitisedText = sText;
@@ -4334,6 +4340,14 @@ async function onSanitise() {
   }
   mapping.sanitisedFilenames[state.selectedFile] = outputSanitisedName;
   await saveMapping(c.rawHandle, mapping);
+  // Refresh the in-memory file entry so the sidebar and selectFile see
+  // the new safe name straight away, without waiting for a full case
+  // re-scan.
+  const fileEntry = (c.files || []).find((f) => f.name === state.selectedFile);
+  if (fileEntry) {
+    fileEntry.sanitisedName = outputSanitisedName;
+    fileEntry.hasSanitised = true;
+  }
   const added = accumulateWatchlist(state.watchlist, mapping, c.id);
   if (added) await saveWatchlist(state.handles.root, state.watchlist);
   const verbatimAudit = verbatimIds.length ? `; ${verbatimIds.length} verbatim block(s)` : '';
