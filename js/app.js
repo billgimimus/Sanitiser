@@ -1229,6 +1229,13 @@ function detectEntities(text, mapping, safeSet) {
     const spans = d.run(text);
     for (const s of spans) raw.push({ ...s, order });
   });
+  // Mapping-hit pass: scan the text for the exact originals and aliases
+  // of every mapping entry. This catches identifiers that no regex
+  // detector recognises (a lender name added via Tokenise selection,
+  // an unusual client surname) so they always show up as "known" and
+  // get auto-tokenised - otherwise checkOutgoing would refuse export.
+  const mappingHits = detectMappingHits(text, mapping);
+  for (const s of mappingHits) raw.push({ ...s, order: -1 });
   raw.sort((a, b) => {
     if (a.start !== b.start) return a.start - b.start;
     if (b.end - b.start !== a.end - a.start) return (b.end - b.start) - (a.end - a.start);
@@ -1260,6 +1267,46 @@ function buildSafeSet(caseSafeList, globalSafeList) {
   for (const entry of caseSafeList || []) set.add(String(entry).toLowerCase());
   for (const entry of globalSafeList || []) set.add(String(entry).toLowerCase());
   return set;
+}
+
+/**
+ * Scan `text` for every mapping entry's original (and its aliases) and
+ * emit a span per hit. Sorted-by-length prevention against overlap is
+ * handled by the main detectEntities dedupe pass. Longest first so
+ * "Anna Kowalski" wins over the "Anna" alias when both would match.
+ */
+function detectMappingHits(text, mapping) {
+  const entries = ((mapping && mapping.entries) || []).filter((e) => e && e.original && e.token);
+  if (!entries.length) return [];
+  const out = [];
+  const seen = new Set();
+  const needles = [];
+  for (const entry of entries) {
+    const strings = [entry.original, ...((entry.aliases || []))];
+    for (const s of strings) {
+      if (!s || s.length < 2) continue;
+      needles.push({ needle: s, entry });
+    }
+  }
+  needles.sort((a, b) => b.needle.length - a.needle.length);
+  for (const n of needles) {
+    const escaped = n.needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const rx = new RegExp(escaped, 'gi');
+    let m;
+    while ((m = rx.exec(text)) !== null) {
+      const key = `${m.index}|${m[0].length}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({
+        start: m.index,
+        end: m.index + m[0].length,
+        text: m[0],
+        category: n.entry.category || 'custom',
+      });
+      if (out.length > 5000) return out;
+    }
+  }
+  return out;
 }
 
 function decorateWithMapping(span, mapping, text) {
@@ -2019,7 +2066,7 @@ function openReviewDialog(entities, mapping, options = {}) {
       if (!rowEl) return;
       const idx = Number(rowEl.dataset.idx);
       if (ev.target.matches('input[data-role="custom"]')) {
-        const custom = ev.target.value.trim();
+        const custom = normaliseCustomToken(ev.target.value.trim());
         if (custom) {
           decisions[idx].token = custom;
         } else {
@@ -2548,6 +2595,15 @@ function init() {
   if (searchBtn) searchBtn.addEventListener('click', onOpenSearch);
   const helpRailBtn = document.querySelector('.icon-rail-item[title="Help"]');
   if (helpRailBtn) helpRailBtn.addEventListener('click', openAboutPanel);
+  const recentBtn = document.querySelector('.icon-rail-item[title="Recent activity"]');
+  if (recentBtn) recentBtn.addEventListener('click', openRecentActivityPanel);
+  const watchBtn = document.querySelector('.icon-rail-item[title="Watchlist & conflicts"]');
+  if (watchBtn) watchBtn.addEventListener('click', openWatchlistPanel);
+  const auditRailBtn = document.querySelector('.icon-rail-item[title="Audit log"]');
+  if (auditRailBtn) auditRailBtn.addEventListener('click', openGlobalAuditPanel);
+  const settingsBtn = document.querySelector('.icon-rail-item[title="Settings"]');
+  if (settingsBtn) settingsBtn.addEventListener('click', openSettingsPanel);
+  installFloatingTokeniseButton();
   document.querySelectorAll('#sidebar .tab').forEach((btn) => {
     btn.addEventListener('click', () => switchSidebarView(btn.dataset.view));
   });
@@ -2590,6 +2646,8 @@ async function onOpenRoot() {
     state.watchlist = await loadWatchlist(state.handles.root);
     document.getElementById('root-path').textContent = state.handles.root.name || 'Casework folder ready';
     if (btn) { btn.textContent = 'Change folder'; }
+    const welcome = document.getElementById('welcome');
+    if (welcome) welcome.innerHTML = renderReadyWelcome();
     const toggle = document.getElementById('ner-toggle');
     toggle.checked = !!state.globalSettings.nerEnabled;
     updateNerStatus();
@@ -3518,6 +3576,217 @@ function exportAboutText() {
   setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 0);
 }
 
+function renderReadyWelcome() {
+  return `
+    <div class="welcome-eyebrow">Ready</div>
+    <h1 style="font-size:18px;margin-top:0;">Casework folder ready.</h1>
+    <p class="welcome-lead">Pick a case from the sidebar to open a file, or add a new one with <strong>New case</strong>. Files added to the folder externally (SharePoint sync) will appear after clicking <strong>Refresh</strong>.</p>
+  `;
+}
+
+function openRecentActivityPanel() {
+  aggregateAuditModal('Recent activity across all cases', 200);
+}
+
+function openGlobalAuditPanel() {
+  aggregateAuditModal('Audit log across all cases', 500);
+}
+
+async function aggregateAuditModal(title, maxRows) {
+  if (!state.handles) { showToast('Open a casework folder first.', true); return; }
+  const root = document.getElementById('dialog-root');
+  root.innerHTML = '';
+  const backdrop = document.createElement('div');
+  backdrop.className = 'modal-backdrop';
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+  modal.style.width = '820px';
+  backdrop.appendChild(modal);
+  modal.innerHTML = `<div class="modal-header">${escapeHtml(title)}</div><div class="modal-body"><div class="muted">Reading audit logs...</div></div><div class="modal-footer"><button class="primary" data-action="ok">Close</button></div>`;
+  root.appendChild(backdrop);
+  modal.addEventListener('click', (ev) => { if (ev.target.dataset && ev.target.dataset.action === 'ok') backdrop.remove(); });
+  const rows = [];
+  const cases = [
+    ...(await listCases(state.handles, 'open')),
+    ...(await listCases(state.handles, 'closed')),
+  ];
+  for (const c of cases) {
+    try {
+      const { text } = await readFileText(c.rawHandle, '_audit.log');
+      for (const line of text.split('\n')) {
+        if (!line.trim()) continue;
+        const idx = line.indexOf('\t');
+        rows.push({ stamp: idx > 0 ? line.slice(0, idx) : '', text: idx > 0 ? line.slice(idx + 1) : line, caseId: c.id });
+      }
+    } catch (_e) { /* no audit yet */ }
+  }
+  rows.sort((a, b) => (a.stamp > b.stamp ? -1 : 1));
+  const shown = rows.slice(0, maxRows);
+  const body = modal.querySelector('.modal-body');
+  if (!shown.length) {
+    body.innerHTML = '<div class="muted">No audit entries yet across any case.</div>';
+    return;
+  }
+  body.innerHTML = `
+    <p class="muted">Newest first. Showing ${shown.length} of ${rows.length}.</p>
+    <table style="width:100%;border-collapse:collapse;">
+      ${shown.map((r) => `<tr><td style="white-space:nowrap;font-family:var(--mono);font-size:11px;color:var(--muted);padding:4px 8px;">${escapeHtml(r.stamp)}</td><td style="padding:4px 8px;font-weight:600;">${escapeHtml(r.caseId)}</td><td style="padding:4px 8px;">${escapeHtml(r.text)}</td></tr>`).join('')}
+    </table>`;
+}
+
+async function openWatchlistPanel() {
+  if (!state.handles) { showToast('Open a casework folder first.', true); return; }
+  const root = document.getElementById('dialog-root');
+  root.innerHTML = '';
+  const backdrop = document.createElement('div');
+  backdrop.className = 'modal-backdrop';
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+  modal.style.width = '820px';
+  backdrop.appendChild(modal);
+  const entries = (state.watchlist && state.watchlist.entries) || [];
+  const rows = entries.length
+    ? [...entries].sort((a, b) => (b.addedAt || '').localeCompare(a.addedAt || '')).map((e) => `
+      <tr>
+        <td style="padding:4px 8px;font-family:var(--mono);font-size:12px;">${escapeHtml(e.original)}</td>
+        <td style="padding:4px 8px;"><span class="chip">${escapeHtml(e.category || '')}</span></td>
+        <td style="padding:4px 8px;"><span class="chip">${escapeHtml(e.matchStrength || 'soft')}</span></td>
+        <td style="padding:4px 8px;font-weight:600;">${escapeHtml(e.caseId)}</td>
+        <td style="padding:4px 8px;font-family:var(--mono);font-size:11px;color:var(--muted);">${escapeHtml((e.addedAt || '').slice(0, 10))}</td>
+      </tr>`).join('')
+    : '<tr><td colspan="5" class="muted" style="padding:12px;">No watchlist entries yet. Each successful sanitisation appends the case\'s mapping originals here so cross-case matches surface on the next sanitisation.</td></tr>';
+  modal.innerHTML = `
+    <div class="modal-header">Cross-case watchlist (${entries.length} entr${entries.length === 1 ? 'y' : 'ies'})</div>
+    <div class="modal-body">
+      <p class="muted">Every real identifier ever tokenised in any case, open or closed. On the next sanitisation of a different case, matches here surface at the top of the review dialog. Match strength is graded lightly (hard for addresses, phones, refs; medium for name-only; soft otherwise) and stored on each entry.</p>
+      <table style="width:100%;border-collapse:collapse;">
+        <thead><tr><th style="padding:6px 8px;text-align:left;">Original</th><th style="padding:6px 8px;text-align:left;">Category</th><th style="padding:6px 8px;text-align:left;">Strength</th><th style="padding:6px 8px;text-align:left;">Case</th><th style="padding:6px 8px;text-align:left;">Added</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+    <div class="modal-footer">
+      <button class="primary" data-action="ok">Close</button>
+    </div>
+  `;
+  root.appendChild(backdrop);
+  modal.addEventListener('click', (ev) => { if (ev.target.dataset && ev.target.dataset.action === 'ok') backdrop.remove(); });
+}
+
+function openSettingsPanel() {
+  const root = document.getElementById('dialog-root');
+  root.innerHTML = '';
+  const backdrop = document.createElement('div');
+  backdrop.className = 'modal-backdrop';
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+  modal.style.width = '760px';
+  backdrop.appendChild(modal);
+  const g = state.globalSettings || { safeList: [], nerEnabled: false };
+  const nerLabel = g.nerEnabled ? 'on' : 'off';
+  modal.innerHTML = `
+    <div class="modal-header">Settings and help</div>
+    <div class="modal-body">
+      <h3 style="font-size:14px;margin-top:0;">Options</h3>
+      <ul>
+        <li><strong>Enhanced detection (NER):</strong> ${nerLabel}. Toggle from the switch in the topbar. First activation downloads a ~50 MB model from huggingface.co.</li>
+        <li><strong>Global safe list:</strong> ${(g.safeList || []).length} entr${(g.safeList || []).length === 1 ? 'y' : 'ies'}. Strings on this list are skipped by detection in every case. Manage per-item via the "Safe everywhere" button in the review dialog.</li>
+        <li><strong>Casework folder:</strong> remembered across sessions in IndexedDB. Reload the page and the topbar button reads "Reopen [folder]".</li>
+      </ul>
+      <h3 style="font-size:14px;margin-top:20px;">Help guide</h3>
+      <h4 style="font-size:13px;margin-bottom:4px;">Daily workflow</h4>
+      <ol>
+        <li>Open the casework folder from the topbar.</li>
+        <li>Pick a case, drop or open a file.</li>
+        <li>Click <strong>Sanitise this file</strong>. The review dialog shows any items needing a decision.</li>
+        <li>Click <strong>Copy sanitised</strong> and paste to your AI service.</li>
+        <li>Copy the AI reply, click <strong>Paste rehydrate</strong>, paste result into Outlook or the CRM.</li>
+      </ol>
+      <h4 style="font-size:13px;margin-bottom:4px;">Adding a token by hand</h4>
+      <p>Highlight the text in the Original tab and click <strong>Tokenise selection</strong> in the file header (or the floating button that appears near the highlight). Custom tokens can be typed without brackets - "LENDER" becomes "[LENDER]" automatically.</p>
+      <h4 style="font-size:13px;margin-bottom:4px;">Verbatim block for CRM referral notes</h4>
+      <p>Wrap the section you need reproduced word-for-word in <code>&lt;verbatim&gt;...&lt;/verbatim&gt;</code> in the raw source. On sanitise it becomes <code>&lt;verbatim-referral id="v_..."&gt;...&lt;/verbatim-referral&gt;</code>; on rehydrate it is byte-matched against the recorded original. Any change from the AI is flagged.</p>
+      <h4 style="font-size:13px;margin-bottom:4px;">Rename a case (R-number to A-number)</h4>
+      <p>Every open case has a <strong>Rename</strong> button. Renaming updates both the raw and sanitised folders, the case ID in the mapping and closure log, and any watchlist entries pointing at the old ID.</p>
+      <h4 style="font-size:13px;margin-bottom:4px;">Files added by SharePoint or Explorer</h4>
+      <p>The tool cannot watch the filesystem. Click <strong>Refresh</strong> in the sidebar to re-scan. New case folders and new files added externally show up straight away.</p>
+      <h4 style="font-size:13px;margin-bottom:4px;">Extracting binary files</h4>
+      <p>PDFs, .msg, .eml, and images (OCR) can be extracted in-place: open the file and click <strong>Extract to text</strong>. The result is saved as a .txt sibling ready to sanitise.</p>
+      <h4 style="font-size:13px;margin-bottom:4px;">Mapping edits</h4>
+      <p>Every case has a <strong>Mapping</strong> button showing an editable table. Renaming a token propagates the rename across every already-sanitised file in the case.</p>
+      <p style="margin-top:20px;"><a href="#" data-action="about">Open About panel</a> for the pseudonymisation guarantee, residual risks, and the compliance boundary statement.</p>
+    </div>
+    <div class="modal-footer">
+      <button class="primary" data-action="ok">Close</button>
+    </div>
+  `;
+  root.appendChild(backdrop);
+  modal.addEventListener('click', (ev) => {
+    const a = ev.target.dataset && ev.target.dataset.action;
+    if (a === 'ok') backdrop.remove();
+    if (a === 'about') { backdrop.remove(); openAboutPanel(); }
+  });
+}
+
+/**
+ * A small floating "Tokenise selection" button that follows the current
+ * highlight when the adviser marks text inside the file view. Uses
+ * mouseup so the caret rectangle has been finalised. The selection
+ * text is captured at button-creation time so opening the modal does
+ * not lose it to a focus change.
+ */
+let floatingTokBtn = null;
+let floatingTokText = '';
+function installFloatingTokeniseButton() {
+  document.addEventListener('mouseup', () => {
+    setTimeout(handleSelectionForFloating, 0);
+  });
+  document.addEventListener('keyup', (ev) => {
+    if (ev.key === 'Escape') hideFloatingTokBtn();
+  });
+  window.addEventListener('scroll', hideFloatingTokBtn, true);
+}
+
+function handleSelectionForFloating() {
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0) return hideFloatingTokBtn();
+  const text = sel.toString().trim();
+  if (!text || text.length < 2) return hideFloatingTokBtn();
+  const range = sel.getRangeAt(0);
+  const container = range.commonAncestorContainer;
+  const el = container.nodeType === 1 ? container : container.parentElement;
+  if (!el || !el.closest('#file-view')) return hideFloatingTokBtn();
+  const rect = range.getBoundingClientRect();
+  if (!rect || (!rect.width && !rect.height)) return hideFloatingTokBtn();
+  floatingTokText = text;
+  showFloatingTokBtn(rect);
+}
+
+function showFloatingTokBtn(rect) {
+  if (!floatingTokBtn) {
+    floatingTokBtn = document.createElement('button');
+    floatingTokBtn.className = 'primary';
+    floatingTokBtn.textContent = 'Tokenise selection';
+    floatingTokBtn.style.cssText = 'position:fixed;z-index:250;box-shadow:var(--shadow-toast);font-size:11px;padding:3px 10px;height:26px;';
+    floatingTokBtn.addEventListener('mousedown', (e) => { e.preventDefault(); });
+    floatingTokBtn.addEventListener('click', () => {
+      const captured = floatingTokText;
+      hideFloatingTokBtn();
+      onTokeniseSelection(captured);
+    });
+    document.body.appendChild(floatingTokBtn);
+  }
+  const left = Math.min(window.innerWidth - 160, Math.max(4, rect.right + 6));
+  const top = Math.max(4, rect.top - 4);
+  floatingTokBtn.style.left = `${left}px`;
+  floatingTokBtn.style.top = `${top}px`;
+  floatingTokBtn.hidden = false;
+}
+
+function hideFloatingTokBtn() {
+  if (floatingTokBtn) floatingTokBtn.hidden = true;
+  floatingTokText = '';
+}
+
 function aboutPlainText() {
   return [
     `Casework Sanitisation Tool - version ${TOOL_VERSION}`,
@@ -3566,6 +3835,22 @@ function aboutPlainText() {
  * both an original and a token are considered. Case-insensitive.
  * Longest originals first so short aliases do not partially match.
  */
+/**
+ * Wrap a bare role name with square brackets so the adviser can type
+ * "LENDER" and get "[LENDER]" without being blocked. Existing brackets
+ * (partial or full) are respected. Whitespace-only input returns
+ * unchanged so callers can distinguish empty from unresolved.
+ */
+function normaliseCustomToken(raw) {
+  const trimmed = String(raw || '').trim();
+  if (!trimmed) return '';
+  let out = trimmed;
+  if (out.startsWith('[') && !out.endsWith(']')) out = out + ']';
+  else if (!out.startsWith('[') && out.endsWith(']')) out = '[' + out;
+  else if (!out.startsWith('[') && !out.endsWith(']')) out = '[' + out + ']';
+  return out;
+}
+
 function sanitiseFilenameForHeader(filename, mapping) {
   if (!filename) return filename;
   let out = String(filename);
@@ -4692,8 +4977,8 @@ function updateNerStatus(label) {
  * sanitisation path so integrity checks (checkOutgoing, verbatim,
  * special category) run.
  */
-async function onTokeniseSelection() {
-  const selection = String(window.getSelection ? window.getSelection().toString() : '').trim();
+async function onTokeniseSelection(providedSelection) {
+  const selection = String(providedSelection != null ? providedSelection : (window.getSelection ? window.getSelection().toString() : '')).trim();
   if (!selection) {
     showToast('Highlight some text in the Original tab first, then click Tokenise selection.', true);
     return;
@@ -4778,9 +5063,9 @@ function promptForToken(sampleText) {
       if (a === 'ok') {
         const custom = modal.querySelector('#tokenise-custom').value.trim();
         const role = modal.querySelector('#tokenise-role').value;
-        const picked = custom || role;
+        const picked = normaliseCustomToken(custom || role);
         if (!/^\[[^\]]+\]$/.test(picked)) {
-          showToast('Token must be in [ROLE] form. For example [CL] or [LENDER].', true);
+          showToast('Token must contain a role name, for example CL or LENDER.', true);
           return;
         }
         backdrop.remove();
