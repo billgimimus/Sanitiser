@@ -137,7 +137,7 @@ const CATEGORY_LABELS = {
   address_line: 'Address line',
   currency: 'Currency amount (preserved)',
   date: 'Date (preserved)',
-  url: 'URL (review)',
+  url: 'URL (auto-tokenised)',
   custom: 'Custom',
 };
 
@@ -148,7 +148,6 @@ const CATEGORY_LABELS = {
 const JUDGEMENT_CATEGORIES = new Set([
   'name_possible',
   'address_line',
-  'url',
 ]);
 
 /**
@@ -3688,13 +3687,54 @@ async function onSanitise() {
   // approved these; showing them again is noise.
   const knownEntities = entities.filter((e) => e.known && e.known.token);
   const unknownEntitiesAll = entities.filter((e) => !e.known || !e.known.token);
-  // Dedupe unknown entities by (case-insensitive) text: the review dialog
+  // URLs are auto-tokenised without review. The domain, path, or query
+  // string can carry identifying material (a lender's brand in a
+  // hostname, a client's name in a share link) which the review layer
+  // would otherwise ask the adviser about one URL at a time. Numbered
+  // [URL_N] tokens keep the mapping consistent and let rehydration
+  // recover the original URL.
+  const urlAutoDecisions = [];
+  const nonUrlUnknowns = [];
+  {
+    let urlCounter = 0;
+    for (const entry of mapping.entries) {
+      const m = /^\[URL_(\d+)\]$/.exec(entry.token || '');
+      if (m) urlCounter = Math.max(urlCounter, parseInt(m[1], 10));
+    }
+    const urlTokenByText = new Map();
+    const now = new Date().toISOString();
+    for (const e of unknownEntitiesAll) {
+      if (e.category !== 'url') { nonUrlUnknowns.push(e); continue; }
+      const key = (e.text || '').trim();
+      if (!key) continue;
+      let token = urlTokenByText.get(key.toLowerCase());
+      if (!token) {
+        const existing = findByOriginal(mapping, key);
+        if (existing && existing.token) {
+          token = existing.token;
+        } else {
+          urlCounter++;
+          token = `[URL_${urlCounter}]`;
+          mapping.entries.push({
+            original: key,
+            token,
+            category: 'url',
+            aliases: [],
+            createdAt: now,
+          });
+        }
+        urlTokenByText.set(key.toLowerCase(), token);
+      }
+      urlAutoDecisions.push({ ...e, action: 'tokenise', token });
+    }
+  }
+  // Dedupe non-URL unknowns by (case-insensitive) text: the review dialog
   // should ask about "Kieran Beatham" once, not once per occurrence in the
   // document. After the adviser decides, that decision is expanded back
   // to every occurrence during application.
   const occurrencesByKey = new Map();
   const unknownEntities = [];
-  for (const e of unknownEntitiesAll) {
+  for (const e of nonUrlUnknowns) {
     const key = (e.text || '').toLowerCase().trim();
     if (!key) continue;
     if (occurrencesByKey.has(key)) {
@@ -3710,7 +3750,7 @@ async function onSanitise() {
     title: state.selectedFile,
     documentText: state.currentText,
     priorSummary,
-    autoAppliedCount: knownEntities.length,
+    autoAppliedCount: knownEntities.length + urlAutoDecisions.length,
     specialCategoryFlags: earlySpecialFlags,
   });
   if (!result) return;
@@ -3740,7 +3780,7 @@ async function onSanitise() {
     action: 'tokenise',
     token: e.known.token,
   }));
-  const allDecisions = [...autoDecisions, ...expandedReviewedDecisions].sort((a, b) => a.start - b.start);
+  const allDecisions = [...autoDecisions, ...urlAutoDecisions, ...expandedReviewedDecisions].sort((a, b) => a.start - b.start);
   const sanitisedRaw = applySanitisation(state.currentText, allDecisions);
   let sanitised;
   let verbatimIds = [];
@@ -3784,8 +3824,9 @@ async function onSanitise() {
   const verbatimAudit = verbatimIds.length ? `; ${verbatimIds.length} verbatim block(s)` : '';
   const watchlistAudit = added ? `; ${added} new watchlist entrie(s)` : '';
   const autoNote = autoDecisions.length ? `; ${autoDecisions.length} auto-applied from mapping` : '';
+  const urlNote = urlAutoDecisions.length ? `; ${urlAutoDecisions.length} URL(s) auto-tokenised` : '';
   const specialAudit = specialFlags.length ? `; special-category signals: ${summariseSpecialCategoryFlags(specialFlags).join(', ')}` : '';
-  await appendAudit(c.rawHandle, `Sanitised (v${TOOL_VERSION}): ${state.selectedFile} (${result.decisions.length} reviewed decisions, ${result.mappingUpdates.length} new mapping entries)${autoNote}${safeAudit ? `; ${safeAudit}` : ''}${verbatimAudit}${watchlistAudit}${specialAudit}`);
+  await appendAudit(c.rawHandle, `Sanitised (v${TOOL_VERSION}): ${state.selectedFile} (${result.decisions.length} reviewed decisions, ${result.mappingUpdates.length} new mapping entries)${autoNote}${urlNote}${safeAudit ? `; ${safeAudit}` : ''}${verbatimAudit}${watchlistAudit}${specialAudit}`);
   state.currentMapping = mapping;
   await selectFile(state.selectedFile);
   showToast(verbatimIds.length ? `Sanitised file written with ${verbatimIds.length} verbatim block(s).` : 'Sanitised file written.');
