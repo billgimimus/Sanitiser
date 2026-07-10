@@ -769,10 +769,15 @@ async function ensureNerPipeline(onProgress) {
   state.nerLoading = true;
   try {
     const T = window.Transformers;
-    T.env.backends.onnx.wasm.wasmPaths = 'lib/';
-    // file:// blocks SharedArrayBuffer, so the threaded WASM builds
-    // can never run here. Force single-threaded so ORT stops probing
-    // for a threaded backend and settles on ort-wasm-simd.wasm.
+    // Chrome blocks fetch() from a file:// page to sibling file:// URLs,
+    // which is how ORT normally loads its WASM. Route ORT at a Blob URL
+    // built from the base64 bytes vendored in lib/ort-wasm-simd.b64.js.
+    // Blob URLs count as same-origin as the page that created them, so
+    // this bypasses the restriction without needing a local server.
+    const wasmUrl = ensureOrtWasmBlobUrl();
+    T.env.backends.onnx.wasm.wasmPaths = { 'ort-wasm-simd.wasm': wasmUrl };
+    // SharedArrayBuffer is unavailable from file://, so any threaded
+    // build cannot run. Force single-threaded.
     T.env.backends.onnx.wasm.numThreads = 1;
     T.env.allowLocalModels = false;
     const pipe = await T.pipeline('token-classification', NER_MODEL_ID, {
@@ -784,15 +789,33 @@ async function ensureNerPipeline(onProgress) {
   } catch (err) {
     const wrapped = new Error(
       `${err && err.message ? err.message : String(err)}. `
-      + `Check DevTools console for the underlying ONNX Runtime error. `
-      + `Common causes: the two vendored files lib/ort-wasm.wasm and `
-      + `lib/ort-wasm-simd.wasm are missing, the browser is offline for the `
-      + `first-run model download, or the huggingface.co host is blocked.`
+      + `Check DevTools console for the underlying error. `
+      + `Common causes: lib/ort-wasm-simd.b64.js failed to load (check the Network tab), `
+      + `the browser is offline for the first-run model download, or the huggingface.co host is blocked.`
     );
     throw wrapped;
   } finally {
     state.nerLoading = false;
   }
+}
+
+/**
+ * Build (once) a Blob URL that holds the ORT SIMD WASM bytes decoded
+ * from the base64 wrapper in lib/ort-wasm-simd.b64.js. The URL persists
+ * for the life of the session so re-toggling NER after switching it
+ * off is instant.
+ */
+let ortWasmBlobUrl = null;
+function ensureOrtWasmBlobUrl() {
+  if (ortWasmBlobUrl) return ortWasmBlobUrl;
+  const b64 = window.__ORT_WASM_SIMD_B64;
+  if (!b64) throw new Error('lib/ort-wasm-simd.b64.js not loaded');
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const blob = new Blob([bytes], { type: 'application/wasm' });
+  ortWasmBlobUrl = URL.createObjectURL(blob);
+  return ortWasmBlobUrl;
 }
 
 /**
