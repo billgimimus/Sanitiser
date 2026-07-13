@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.Spider" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">#0F5132</item>
+        <item name="android:navigationBarColor">#0F5132</item>
+        <item name="android:windowBackground">@color/table_green</item>
+    </style>
+</resources>

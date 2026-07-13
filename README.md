@@ -1,5 +1,8 @@
 # Casework Sanitisation Tool
 
+> Also in this repo: an unrelated ads-free Spider Solitaire Android app —
+> Kotlin + Jetpack Compose. See [`android/README.md`](android/README.md).
+
 A single-user, browser-based tool that pseudonymises housing casework material before the user pastes sanitised text into an external AI service, and rehydrates the AI's output back to real identifiers before it reaches client-facing systems.
 
 The tool runs entirely locally in a modern Chromium browser tab. No case data is transmitted anywhere. The only inbound network call in future phases is an optional one-time named-entity model download.
