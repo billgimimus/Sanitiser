@@ -4610,9 +4610,9 @@ async function onPasteRehydrate() {
   }
   const c = state.cases.find((x) => x.id === state.selectedCaseId);
   if (!c) return;
-  let text = '';
-  try { text = await readText(); } catch (err) { showToast(err.message, true); return; }
-  if (!text) { showToast('Clipboard is empty.', true); return; }
+  const text = await openRehydrateInputDialog();
+  if (text == null) return;
+  if (!text.trim()) { showToast('Nothing to rehydrate - the input was empty.', true); return; }
   const mapping = await loadMapping(c.rawHandle, c.id);
   const { hits, replaced, cleaned, verbatimMismatches } = rehydrate(text, mapping);
   if (verbatimMismatches && verbatimMismatches.length) {
@@ -4635,6 +4635,183 @@ async function onPasteRehydrate() {
   } catch (err) {
     showToast(err.message, true);
   }
+}
+
+/**
+ * Ask the adviser for the AI reply as either a paste into a textarea or
+ * a dropped .txt / .docx file. Ctrl+V into the textarea always works,
+ * so this sidesteps the "document not focused" clipboard-read failure
+ * that the old direct-read path hit whenever the tool tab was not the
+ * active window. Resolves to the text or null on cancel.
+ */
+function openRehydrateInputDialog() {
+  return new Promise((resolve) => {
+    const root = document.getElementById('dialog-root');
+    root.innerHTML = '';
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop';
+    const modal = document.createElement('div');
+    modal.className = 'modal';
+    modal.style.width = '760px';
+    backdrop.appendChild(modal);
+    modal.innerHTML = `
+      <div class="modal-header">Paste the AI reply to rehydrate</div>
+      <div class="modal-body">
+        <p class="muted" style="margin-top:0;">Ctrl+V into the box, or drop a <code>.txt</code> or <code>.docx</code> file. Rehydration runs against the selected case's mapping.</p>
+        <textarea id="rehy-textarea" spellcheck="false" style="width:100%;min-height:260px;font-family:var(--mono);font-size:12px;padding:8px;border:1px solid var(--border);border-radius:4px;box-sizing:border-box;" placeholder="Paste the AI reply here..."></textarea>
+        <div id="rehy-dropzone" style="margin-top:8px;padding:14px;border:2px dashed var(--border);border-radius:6px;text-align:center;color:var(--muted);font-size:12px;">
+          Or drop a <strong>.txt</strong> or <strong>.docx</strong> file here.
+          <div style="margin-top:6px;"><input id="rehy-file" type="file" accept=".txt,.docx,text/plain,application/vnd.openxmlformats-officedocument.wordprocessingml.document" style="font-size:12px;"></div>
+        </div>
+        <div id="rehy-status" class="muted" style="margin-top:6px;font-size:12px;"></div>
+      </div>
+      <div class="modal-footer">
+        <button data-action="cancel">Cancel</button>
+        <button class="primary" data-action="ok">Rehydrate</button>
+      </div>
+    `;
+    root.appendChild(backdrop);
+    const ta = modal.querySelector('#rehy-textarea');
+    const status = modal.querySelector('#rehy-status');
+    const dropzone = modal.querySelector('#rehy-dropzone');
+    const fileInput = modal.querySelector('#rehy-file');
+    // Best-effort autofill from clipboard: silent on failure so the
+    // adviser can still paste manually.
+    (async () => {
+      try {
+        if (navigator.clipboard && navigator.clipboard.readText) {
+          const cb = await navigator.clipboard.readText();
+          if (cb && !ta.value) {
+            ta.value = cb;
+            status.textContent = `Prefilled ${cb.length} characters from the clipboard. Edit or replace as needed.`;
+          }
+        }
+      } catch (_e) { /* focus / permission - user pastes manually */ }
+    })();
+    setTimeout(() => ta.focus(), 30);
+    async function loadFile(file) {
+      if (!file) return;
+      const name = file.name.toLowerCase();
+      status.textContent = `Reading ${file.name}...`;
+      try {
+        if (name.endsWith('.docx')) {
+          const buf = await file.arrayBuffer();
+          const text = await extractDocxText(buf);
+          ta.value = text;
+          status.textContent = `Loaded ${file.name} (${text.length} characters extracted from .docx).`;
+        } else {
+          const text = await file.text();
+          ta.value = text;
+          status.textContent = `Loaded ${file.name} (${text.length} characters).`;
+        }
+      } catch (err) {
+        status.textContent = `Could not read ${file.name}: ${err.message}`;
+      }
+    }
+    fileInput.addEventListener('change', () => loadFile(fileInput.files && fileInput.files[0]));
+    dropzone.addEventListener('dragover', (ev) => { ev.preventDefault(); dropzone.style.borderColor = 'var(--accent)'; });
+    dropzone.addEventListener('dragleave', () => { dropzone.style.borderColor = ''; });
+    dropzone.addEventListener('drop', (ev) => {
+      ev.preventDefault();
+      dropzone.style.borderColor = '';
+      const f = ev.dataTransfer && ev.dataTransfer.files && ev.dataTransfer.files[0];
+      if (f) loadFile(f);
+    });
+    modal.querySelector('[data-action="cancel"]').addEventListener('click', () => { backdrop.remove(); resolve(null); });
+    modal.querySelector('[data-action="ok"]').addEventListener('click', () => { const v = ta.value; backdrop.remove(); resolve(v); });
+  });
+}
+
+/**
+ * Extract plain text from a .docx file. A .docx is a ZIP archive whose
+ * document body lives in word/document.xml. We parse the ZIP central
+ * directory by hand and inflate the payload with the browser's
+ * DecompressionStream API, then pull the text runs out of the XML.
+ * No external library.
+ */
+async function extractDocxText(arrayBuffer) {
+  const bytes = new Uint8Array(arrayBuffer);
+  const view = new DataView(arrayBuffer);
+  // End-of-central-directory record: signature 0x06054b50, within the
+  // last ~64 KB (EOCD comment field caps at 65535 bytes).
+  let eocd = -1;
+  const searchStart = Math.max(0, bytes.length - 22 - 65535);
+  for (let i = bytes.length - 22; i >= searchStart; i--) {
+    if (view.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd === -1) throw new Error('Not a valid ZIP/.docx file (no EOCD record).');
+  const cdEntries = view.getUint16(eocd + 10, true);
+  const cdOffset = view.getUint32(eocd + 16, true);
+  let p = cdOffset;
+  for (let n = 0; n < cdEntries; n++) {
+    if (view.getUint32(p, true) !== 0x02014b50) throw new Error('Central directory record signature mismatch.');
+    const method = view.getUint16(p + 10, true);
+    const compressedSize = view.getUint32(p + 20, true);
+    const filenameLen = view.getUint16(p + 28, true);
+    const extraLen = view.getUint16(p + 30, true);
+    const commentLen = view.getUint16(p + 32, true);
+    const localHeaderOffset = view.getUint32(p + 42, true);
+    const filename = new TextDecoder().decode(bytes.subarray(p + 46, p + 46 + filenameLen));
+    if (filename === 'word/document.xml') {
+      const lhFilenameLen = view.getUint16(localHeaderOffset + 26, true);
+      const lhExtraLen = view.getUint16(localHeaderOffset + 28, true);
+      const dataStart = localHeaderOffset + 30 + lhFilenameLen + lhExtraLen;
+      const compressed = bytes.subarray(dataStart, dataStart + compressedSize);
+      let xmlBytes;
+      if (method === 0) {
+        xmlBytes = compressed;
+      } else if (method === 8) {
+        if (typeof DecompressionStream === 'undefined') {
+          throw new Error('DecompressionStream not available; cannot inflate .docx in this browser.');
+        }
+        const blob = new Blob([compressed]);
+        const stream = blob.stream().pipeThrough(new DecompressionStream('deflate-raw'));
+        xmlBytes = new Uint8Array(await new Response(stream).arrayBuffer());
+      } else {
+        throw new Error(`Unsupported ZIP compression method ${method} for word/document.xml.`);
+      }
+      const xml = new TextDecoder().decode(xmlBytes);
+      return docxXmlToText(xml);
+    }
+    p += 46 + filenameLen + extraLen + commentLen;
+  }
+  throw new Error('No word/document.xml in the archive - is this really a .docx?');
+}
+
+/**
+ * Reduce Word's document.xml to plain text. Preserves paragraph breaks
+ * (`</w:p>`), soft line breaks (`<w:br/>`) and tabs (`<w:tab/>`), and
+ * concatenates each paragraph's `<w:t>...</w:t>` runs in document order.
+ * XML entities are decoded so tokens like `[LANDLORD'S SOLICITOR]`
+ * survive intact through &apos; -> ' conversion.
+ */
+function docxXmlToText(xml) {
+  const paragraphs = xml.split(/<\/w:p>/);
+  const out = [];
+  const partRx = /<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>|<w:br\s*\/?>|<w:tab\s*\/?>/g;
+  for (const para of paragraphs) {
+    let buf = '';
+    let m;
+    partRx.lastIndex = 0;
+    while ((m = partRx.exec(para)) !== null) {
+      if (m[1] !== undefined) buf += decodeXmlEntities(m[1]);
+      else if (m[0].startsWith('<w:br')) buf += '\n';
+      else if (m[0].startsWith('<w:tab')) buf += '\t';
+    }
+    out.push(buf);
+  }
+  return out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+function decodeXmlEntities(s) {
+  return String(s)
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, n) => String.fromCodePoint(parseInt(n, 16)))
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(parseInt(n, 10)))
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
 }
 
 /**
