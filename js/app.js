@@ -475,10 +475,12 @@ function matchesOf(text, regex, category) {
  * The tool is anchored to a single "root" folder that the adviser picks
  * once per session. Beneath it we materialise four canonical mirrors:
  *
- *   Casework/                    active raw
- *   Casework_sanitised/          active sanitised
- *   Casework_closed/             closed raw
- *   Casework_sanitised_closed/   closed sanitised
+ *   Casework/                     active raw
+ *   Casework_sanitised/           active sanitised
+ *   Casework_rehydrated/          active rehydrated (audit trail)
+ *   Casework_closed/              closed raw
+ *   Casework_sanitised_closed/    closed sanitised
+ *   Casework_rehydrated_closed/   closed rehydrated
  *
  * Any of these that do not already exist are created on first access, so
  * the adviser can point the tool at an empty directory and start working
@@ -492,8 +494,10 @@ function matchesOf(text, regex, category) {
 const ROOTS = {
   activeRaw: 'Casework',
   activeSan: 'Casework_sanitised',
+  activeRehy: 'Casework_rehydrated',
   closedRaw: 'Casework_closed',
   closedSan: 'Casework_sanitised_closed',
+  closedRehy: 'Casework_rehydrated_closed',
 };
 
 function hasFileSystemAccess() {
@@ -510,9 +514,11 @@ async function pickRoot(existingRoot) {
   const root = existingRoot || await window.showDirectoryPicker({ mode: 'readwrite' });
   const activeRaw = await root.getDirectoryHandle(ROOTS.activeRaw, { create: true });
   const activeSan = await root.getDirectoryHandle(ROOTS.activeSan, { create: true });
+  const activeRehy = await root.getDirectoryHandle(ROOTS.activeRehy, { create: true });
   const closedRaw = await root.getDirectoryHandle(ROOTS.closedRaw, { create: true });
   const closedSan = await root.getDirectoryHandle(ROOTS.closedSan, { create: true });
-  return { root, activeRaw, activeSan, closedRaw, closedSan };
+  const closedRehy = await root.getDirectoryHandle(ROOTS.closedRehy, { create: true });
+  return { root, activeRaw, activeSan, activeRehy, closedRaw, closedSan, closedRehy };
 }
 
 /**
@@ -579,24 +585,43 @@ async function clearRootHandle() {
 async function listCases(handles, kind) {
   const rawParent = kind === 'closed' ? handles.closedRaw : handles.activeRaw;
   const sanParent = kind === 'closed' ? handles.closedSan : handles.activeSan;
+  const rehyParent = kind === 'closed' ? handles.closedRehy : handles.activeRehy;
   const cases = [];
   for await (const entry of rawParent.values()) {
     if (entry.kind !== 'directory') continue;
     const rawHandle = entry;
     let sanHandle = null;
+    let rehyHandle = null;
     try {
       sanHandle = await sanParent.getDirectoryHandle(entry.name, { create: true });
     } catch (_e) {
       sanHandle = null;
     }
+    if (rehyParent) {
+      try { rehyHandle = await rehyParent.getDirectoryHandle(entry.name, { create: true }); }
+      catch (_e) { rehyHandle = null; }
+    }
     const mapping = await readJSON(rawHandle, '_mapping.json');
     const { files, aiReplies } = await listFiles(rawHandle, sanHandle, mapping);
+    const rehydrated = rehyHandle ? await listRehydratedFiles(rehyHandle) : [];
     const meta = await tryReadClosure(rawHandle);
     const clientLabel = deriveClientLabel(mapping);
-    cases.push({ id: entry.name, kind, rawHandle, sanHandle, files, aiReplies, meta, clientLabel });
+    cases.push({ id: entry.name, kind, rawHandle, sanHandle, rehyHandle, files, aiReplies, rehydrated, meta, clientLabel });
   }
   cases.sort((a, b) => a.id.localeCompare(b.id));
   return cases;
+}
+
+async function listRehydratedFiles(rehyHandle) {
+  const out = [];
+  for await (const s of rehyHandle.values()) {
+    if (s.kind !== 'file') continue;
+    if (s.name.startsWith('_')) continue;
+    const f = await s.getFile();
+    out.push({ name: s.name, size: f.size, lastModified: f.lastModified });
+  }
+  out.sort((a, b) => (b.lastModified || 0) - (a.lastModified || 0));
+  return out;
 }
 
 /**
@@ -718,9 +743,11 @@ async function writeJSON(dirHandle, name, obj) {
 async function ensureCaseFolders(handles, caseId, closed = false) {
   const rawParent = closed ? handles.closedRaw : handles.activeRaw;
   const sanParent = closed ? handles.closedSan : handles.activeSan;
+  const rehyParent = closed ? handles.closedRehy : handles.activeRehy;
   const rawHandle = await rawParent.getDirectoryHandle(caseId, { create: true });
   const sanHandle = await sanParent.getDirectoryHandle(caseId, { create: true });
-  return { rawHandle, sanHandle };
+  const rehyHandle = rehyParent ? await rehyParent.getDirectoryHandle(caseId, { create: true }) : null;
+  return { rawHandle, sanHandle, rehyHandle };
 }
 
 /**
@@ -731,10 +758,13 @@ async function ensureCaseFolders(handles, caseId, closed = false) {
 async function moveCase(handles, caseId, toClosed) {
   const fromRaw = toClosed ? handles.activeRaw : handles.closedRaw;
   const fromSan = toClosed ? handles.activeSan : handles.closedSan;
+  const fromRehy = toClosed ? handles.activeRehy : handles.closedRehy;
   const toRaw = toClosed ? handles.closedRaw : handles.activeRaw;
   const toSan = toClosed ? handles.closedSan : handles.activeSan;
+  const toRehy = toClosed ? handles.closedRehy : handles.activeRehy;
   await moveDirectory(fromRaw, toRaw, caseId);
   await moveDirectory(fromSan, toSan, caseId);
+  if (fromRehy && toRehy) await moveDirectory(fromRehy, toRehy, caseId);
 }
 
 async function moveDirectory(fromParent, toParent, name) {
@@ -2885,6 +2915,19 @@ function renderSidebar() {
           files.appendChild(ritem);
         }
       }
+      if ((c.rehydrated || []).length) {
+        const heading = document.createElement('div');
+        heading.className = 'ai-replies-heading';
+        heading.textContent = `Rehydrated outputs (${c.rehydrated.length})`;
+        heading.title = 'Rehydrated text that was written back into the Casework_rehydrated folder. Kept as an audit trail so a reviewer can pair each rehydrated file with its tokenised source in the sanitised folder.';
+        files.appendChild(heading);
+        for (const r of c.rehydrated) {
+          const ritem = document.createElement('div');
+          ritem.className = 'file-item ai-reply-item rehydrated-item';
+          ritem.innerHTML = `<span class="file-item-name">${escapeHtml(r.name)}</span><span class="file-item-right"><span class="file-badge done">rehydrated</span></span>`;
+          files.appendChild(ritem);
+        }
+      }
       const actions = document.createElement('div');
       actions.style.padding = '8px 12px';
       actions.style.display = 'flex';
@@ -4654,14 +4697,16 @@ async function onPasteRehydrate() {
   const text = await openRehydrateInputDialog();
   if (text == null) return;
   if (!text.trim()) { showToast('Nothing to rehydrate - the input was empty.', true); return; }
-  await rehydrateTextForCase(c, text, 'clipboard');
+  await rehydrateTextForCase(c, text, { origin: 'paste' });
 }
 
 /**
  * Rehydrate a file the adviser has saved into the case's sanitised
  * folder (typically Claude's reply as .txt or .docx). Reads the file,
  * extracts text if it is a .docx, then hands off to the shared
- * rehydrate pipeline. Same integrity checks as paste-rehydrate.
+ * rehydrate pipeline. Same integrity checks as paste-rehydrate. The
+ * input already lives in the sanitised folder so the shared pipeline
+ * skips duplicating it there.
  */
 async function onRehydrateSanFile(caseObj, name) {
   if (!caseObj || !caseObj.sanHandle) return;
@@ -4677,7 +4722,7 @@ async function onRehydrateSanFile(caseObj, name) {
       text = await file.text();
     }
     if (!text.trim()) { showToast(`${name} is empty.`, true); return; }
-    await rehydrateTextForCase(caseObj, text, `file ${name}`);
+    await rehydrateTextForCase(caseObj, text, { origin: 'file', sourceName: name });
   } catch (err) {
     showToast(`Could not read ${name}: ${err.message}`, true);
   }
@@ -4685,10 +4730,15 @@ async function onRehydrateSanFile(caseObj, name) {
 
 /**
  * Shared rehydrate pipeline: mapping load, integrity/verbatim checks,
- * copy-to-clipboard and audit. `source` is a short label for the audit
- * log so we can tell paste-driven and file-driven rehydrates apart.
+ * copy-to-clipboard, audit trail, and disk persistence. For paste-driven
+ * rehydrates the tokenised input is written to the sanitised folder so a
+ * later reviewer can see what Claude produced. The rehydrated output
+ * always lands in the rehydrated folder alongside a matching basename.
+ * `opts.origin` is 'paste' or 'file'; `opts.sourceName` is the sanitised
+ * file the adviser clicked, if any.
  */
-async function rehydrateTextForCase(c, text, source) {
+async function rehydrateTextForCase(c, text, opts) {
+  const origin = (opts && opts.origin) || 'paste';
   const mapping = await loadMapping(c.rawHandle, c.id);
   const { hits, replaced, cleaned, verbatimMismatches } = rehydrate(text, mapping);
   if (verbatimMismatches && verbatimMismatches.length) {
@@ -4705,13 +4755,65 @@ async function rehydrateTextForCase(c, text, source) {
   }
   try {
     await copyText(replaced, 'rehydrated text');
-    const mismatchNote = verbatimMismatches && verbatimMismatches.length ? `; ${verbatimMismatches.length} verbatim mismatch(es) overridden` : '';
-    const tokenCount = (text.match(/\[[A-Z_]+.*?\]/g) || []).length;
-    await appendAudit(c.rawHandle, `Rehydrated ${text.length} chars from ${source} (${tokenCount} tokens)${mismatchNote}.`);
-    showToast('Rehydrated text copied. Paste into Outlook or CRM.');
   } catch (err) {
     showToast(err.message, true);
+    return;
   }
+  // Persist the trail. Paste-driven rehydrates need both artefacts on
+  // disk; file-driven rehydrates already have the tokenised input in
+  // the sanitised folder and only need the rehydrated output written.
+  let sanitisedName = opts && opts.sourceName ? opts.sourceName : null;
+  let rehydratedName = null;
+  try {
+    if (origin === 'paste') {
+      const stamp = timestampSlug();
+      const baseName = `paste_${stamp}.txt`;
+      await writeFileText(c.sanHandle, baseName, text);
+      sanitisedName = baseName;
+      // Refresh cached list so the sidebar picks up the new sanitised entry.
+      if (c.aiReplies) c.aiReplies.unshift({ name: baseName, size: text.length, lastModified: Date.now() });
+    }
+    if (c.rehyHandle && sanitisedName) {
+      rehydratedName = pairedRehydratedName(sanitisedName);
+      await writeFileText(c.rehyHandle, rehydratedName, replaced);
+      if (!c.rehydrated) c.rehydrated = [];
+      c.rehydrated.unshift({ name: rehydratedName, size: replaced.length, lastModified: Date.now() });
+    }
+  } catch (err) {
+    showToast(`Rehydrated text copied but could not be saved to disk: ${err.message}`, true);
+  }
+  const mismatchNote = verbatimMismatches && verbatimMismatches.length ? `; ${verbatimMismatches.length} verbatim mismatch(es) overridden` : '';
+  const tokenCount = (text.match(/\[[A-Z_]+.*?\]/g) || []).length;
+  const originLabel = origin === 'file' ? `file ${opts.sourceName}` : 'clipboard paste';
+  const savedNote = rehydratedName ? `; saved as ${rehydratedName}` : '';
+  await appendAudit(c.rawHandle, `Rehydrated ${text.length} chars from ${originLabel} (${tokenCount} tokens)${mismatchNote}${savedNote}.`);
+  showToast(rehydratedName
+    ? `Rehydrated text copied and saved to Casework_rehydrated as ${rehydratedName}.`
+    : 'Rehydrated text copied. Paste into Outlook or CRM.');
+  renderSidebar();
+}
+
+/**
+ * Compact filesystem-safe timestamp for auto-generated filenames:
+ * YYYYMMDD_HHMMSS in local time.
+ */
+function timestampSlug() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+/**
+ * Given a sanitised filename ("reply.docx", "paste_20260713_142201.txt"),
+ * return the paired rehydrated filename in the rehydrated folder. Keeps
+ * the basename so a reviewer can eyeball the pairing at a glance; always
+ * writes as .txt (rehydrated output is plain text regardless of source
+ * format).
+ */
+function pairedRehydratedName(sanitisedName) {
+  const dot = sanitisedName.lastIndexOf('.');
+  const base = dot > 0 ? sanitisedName.slice(0, dot) : sanitisedName;
+  return `${base}.rehydrated.txt`;
 }
 
 /**
