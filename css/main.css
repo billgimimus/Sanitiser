@@ -388,6 +388,34 @@ code {
   margin-left: 0;
 }
 
+.ai-replies-heading {
+  margin: 10px 0 4px 8px;
+  padding: 4px 8px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  border-top: 1px dashed var(--border);
+  padding-top: 8px;
+}
+
+.ai-reply-item .file-item-name {
+  font-family: var(--mono);
+}
+.ai-reply-rehy {
+  font-size: 11px;
+  padding: 2px 8px;
+  height: auto;
+  background: var(--accent);
+  color: white;
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.ai-reply-rehy:hover {
+  background: color-mix(in oklab, var(--accent) 85%, black);
+}
+
 .file-item {
   padding: 4px 8px 4px 20px;
   cursor: pointer;

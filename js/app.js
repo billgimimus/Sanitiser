@@ -590,10 +590,10 @@ async function listCases(handles, kind) {
       sanHandle = null;
     }
     const mapping = await readJSON(rawHandle, '_mapping.json');
-    const files = await listFiles(rawHandle, sanHandle, mapping);
+    const { files, aiReplies } = await listFiles(rawHandle, sanHandle, mapping);
     const meta = await tryReadClosure(rawHandle);
     const clientLabel = deriveClientLabel(mapping);
-    cases.push({ id: entry.name, kind, rawHandle, sanHandle, files, meta, clientLabel });
+    cases.push({ id: entry.name, kind, rawHandle, sanHandle, files, aiReplies, meta, clientLabel });
   }
   cases.sort((a, b) => a.id.localeCompare(b.id));
   return cases;
@@ -632,6 +632,7 @@ async function listFiles(rawHandle, sanHandle, mapping) {
       if (s.kind === 'file') sanNames.add(s.name);
     }
   }
+  const referencedSan = new Set();
   const filemap = (mapping && mapping.sanitisedFilenames) || {};
   for await (const entry of rawHandle.values()) {
     if (entry.kind !== 'file') continue;
@@ -641,6 +642,8 @@ async function listFiles(rawHandle, sanHandle, mapping) {
     // file, use it; otherwise fall back to same-name pairing so files
     // sanitised before this feature keep showing up correctly.
     const sanName = filemap[entry.name] || entry.name;
+    referencedSan.add(sanName);
+    referencedSan.add(entry.name);
     out.push({
       name: entry.name,
       sanitisedName: sanName,
@@ -650,7 +653,26 @@ async function listFiles(rawHandle, sanHandle, mapping) {
     });
   }
   out.sort((a, b) => a.name.localeCompare(b.name));
-  return out;
+  // AI-reply candidates: any file in the sanitised folder that isn't
+  // referenced by a raw file (either directly or via the mapping's
+  // filemap). Typically an AI reply the adviser saved into the folder
+  // as .txt or .docx.
+  const aiReplies = [];
+  if (sanHandle) {
+    for await (const s of sanHandle.values()) {
+      if (s.kind !== 'file') continue;
+      if (s.name.startsWith('_')) continue;
+      if (referencedSan.has(s.name)) continue;
+      const f = await s.getFile();
+      aiReplies.push({
+        name: s.name,
+        size: f.size,
+        lastModified: f.lastModified,
+      });
+    }
+    aiReplies.sort((a, b) => (b.lastModified || 0) - (a.lastModified || 0));
+  }
+  return { files: out, aiReplies };
 }
 
 async function tryReadClosure(dirHandle) {
@@ -2844,6 +2866,25 @@ function renderSidebar() {
         drop.textContent = 'No files yet. Drag files here to add them.';
         files.appendChild(drop);
       }
+      if ((c.aiReplies || []).length) {
+        const heading = document.createElement('div');
+        heading.className = 'ai-replies-heading';
+        heading.textContent = `AI replies in sanitised folder (${c.aiReplies.length})`;
+        heading.title = 'Files saved into the sanitised folder that do not pair with a raw case file - most likely an AI reply the adviser dropped in for rehydration.';
+        files.appendChild(heading);
+        for (const r of c.aiReplies) {
+          const ritem = document.createElement('div');
+          ritem.className = 'file-item ai-reply-item';
+          ritem.innerHTML = `<span class="file-item-name">${escapeHtml(r.name)}</span><span class="file-item-right"><button class="ai-reply-rehy" data-role="rehy" type="button" title="Rehydrate this AI reply back to real identifiers and copy the result to the clipboard.">Rehydrate</button></span>`;
+          ritem.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            if (ev.target.dataset && ev.target.dataset.role === 'rehy') {
+              onRehydrateSanFile(c, r.name);
+            }
+          });
+          files.appendChild(ritem);
+        }
+      }
       const actions = document.createElement('div');
       actions.style.padding = '8px 12px';
       actions.style.display = 'flex';
@@ -4613,6 +4654,41 @@ async function onPasteRehydrate() {
   const text = await openRehydrateInputDialog();
   if (text == null) return;
   if (!text.trim()) { showToast('Nothing to rehydrate - the input was empty.', true); return; }
+  await rehydrateTextForCase(c, text, 'clipboard');
+}
+
+/**
+ * Rehydrate a file the adviser has saved into the case's sanitised
+ * folder (typically Claude's reply as .txt or .docx). Reads the file,
+ * extracts text if it is a .docx, then hands off to the shared
+ * rehydrate pipeline. Same integrity checks as paste-rehydrate.
+ */
+async function onRehydrateSanFile(caseObj, name) {
+  if (!caseObj || !caseObj.sanHandle) return;
+  try {
+    const h = await caseObj.sanHandle.getFileHandle(name);
+    const file = await h.getFile();
+    const lower = name.toLowerCase();
+    let text;
+    if (lower.endsWith('.docx')) {
+      const buf = await file.arrayBuffer();
+      text = await extractDocxText(buf);
+    } else {
+      text = await file.text();
+    }
+    if (!text.trim()) { showToast(`${name} is empty.`, true); return; }
+    await rehydrateTextForCase(caseObj, text, `file ${name}`);
+  } catch (err) {
+    showToast(`Could not read ${name}: ${err.message}`, true);
+  }
+}
+
+/**
+ * Shared rehydrate pipeline: mapping load, integrity/verbatim checks,
+ * copy-to-clipboard and audit. `source` is a short label for the audit
+ * log so we can tell paste-driven and file-driven rehydrates apart.
+ */
+async function rehydrateTextForCase(c, text, source) {
   const mapping = await loadMapping(c.rawHandle, c.id);
   const { hits, replaced, cleaned, verbatimMismatches } = rehydrate(text, mapping);
   if (verbatimMismatches && verbatimMismatches.length) {
@@ -4630,7 +4706,8 @@ async function onPasteRehydrate() {
   try {
     await copyText(replaced, 'rehydrated text');
     const mismatchNote = verbatimMismatches && verbatimMismatches.length ? `; ${verbatimMismatches.length} verbatim mismatch(es) overridden` : '';
-    await appendAudit(c.rawHandle, `Rehydrated ${text.length} chars (${(text.match(/\[[A-Z_]+.*?\]/g) || []).length} tokens)${mismatchNote}.`);
+    const tokenCount = (text.match(/\[[A-Z_]+.*?\]/g) || []).length;
+    await appendAudit(c.rawHandle, `Rehydrated ${text.length} chars from ${source} (${tokenCount} tokens)${mismatchNote}.`);
     showToast('Rehydrated text copied. Paste into Outlook or CRM.');
   } catch (err) {
     showToast(err.message, true);
