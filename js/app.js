@@ -661,7 +661,7 @@ async function listFiles(rawHandle, sanHandle, mapping) {
   const filemap = (mapping && mapping.sanitisedFilenames) || {};
   for await (const entry of rawHandle.values()) {
     if (entry.kind !== 'file') continue;
-    if (entry.name === '_mapping.json' || entry.name === '_closure.json' || entry.name === '_audit.log') continue;
+    if (entry.name === '_mapping.json' || entry.name === '_closure.json' || entry.name === '_audit.log' || entry.name === '_debug_export_block.log') continue;
     const file = await entry.getFile();
     // If the mapping remembers a safe-form sanitised name for this raw
     // file, use it; otherwise fall back to same-name pairing so files
@@ -1323,8 +1323,18 @@ function checkOutgoing(sanitisedText, mapping) {
       const skipOriginal = entry.category === 'name_possible' && !/\s/.test(originalTrimmed);
       if (!skipOriginal) {
         const rx = literalRegex(originalTrimmed);
-        const m = sanitisedText.match(rx);
-        if (m) offenders.push({ original: m[0], token: entry.token });
+        const m = rx.exec(sanitisedText);
+        if (m) {
+          offenders.push({
+            original: m[0],
+            token: entry.token,
+            source: 'original',
+            needle: originalTrimmed,
+            category: entry.category,
+            index: m.index,
+            context: contextSlice(sanitisedText, m.index, m[0].length),
+          });
+        }
       }
     }
     // Aliases exist to widen detection (auto-seeded "Gary", "Mr Martino",
@@ -1338,11 +1348,35 @@ function checkOutgoing(sanitisedText, mapping) {
       if (!trimmed) continue;
       if (!/\s/.test(trimmed)) continue;
       const rx = literalRegex(trimmed);
-      const m = sanitisedText.match(rx);
-      if (m) offenders.push({ original: m[0], token: entry.token });
+      const m = rx.exec(sanitisedText);
+      if (m) {
+        offenders.push({
+          original: m[0],
+          token: entry.token,
+          source: 'alias',
+          needle: trimmed,
+          category: entry.category,
+          index: m.index,
+          context: contextSlice(sanitisedText, m.index, m[0].length),
+        });
+      }
     }
   }
   return offenders;
+}
+
+/**
+ * Grab up to 60 characters either side of a match with the match itself
+ * bracketed in ⟪ ⟫ so a log reader can see where the alleged leak
+ * landed. Newlines are collapsed so a one-line entry survives.
+ */
+function contextSlice(text, index, length) {
+  const from = Math.max(0, index - 60);
+  const to = Math.min(text.length, index + length + 60);
+  const before = text.slice(from, index).replace(/\s+/g, ' ');
+  const hit = text.slice(index, index + length);
+  const after = text.slice(index + length, to).replace(/\s+/g, ' ');
+  return `${from > 0 ? '...' : ''}${before}⟪${hit}⟫${after}${to < text.length ? '...' : ''}`;
 }
 
 function literalRegex(str) {
@@ -4507,7 +4541,9 @@ async function onSanitise() {
   }
   const offenders = checkOutgoing(sanitised, mapping);
   if (offenders.length) {
-    showToast(`Sanitisation blocked. ${offenders.length} real identifier${offenders.length === 1 ? '' : 's'} still present: ${offenders.map((o) => o.original).join(', ')}`, true);
+    const logName = await writeExportBlockDebug(c, state.selectedFile, offenders, sanitised, mapping);
+    const detail = offenders.slice(0, 3).map((o) => `${o.source}:"${o.needle}"->${o.token}`).join(', ');
+    showToast(`Sanitisation blocked. ${offenders.length} identifier${offenders.length === 1 ? '' : 's'} still present (${detail}${offenders.length > 3 ? ', ...' : ''}). See ${logName} in the case folder for full details.`, true);
     return;
   }
   const specialFlags = detectSpecialCategorySignals(state.currentText);
@@ -4802,6 +4838,65 @@ async function rehydrateTextForCase(c, text, opts) {
     ? `Rehydrated text copied and saved to Casework_rehydrated as ${rehydratedName}.`
     : 'Rehydrated text copied. Paste into Outlook or CRM.');
   renderSidebar();
+}
+
+/**
+ * Persist a diagnostic file when checkOutgoing blocks the export.
+ * Written to the case's raw folder so the adviser can paste it back to
+ * whoever is debugging without hunting for it. Includes every offender
+ * with its context, the mapping entry it matched, and a snippet of the
+ * sanitised body around each hit. Overwrites on each block so the file
+ * is always the most recent state.
+ */
+async function writeExportBlockDebug(caseObj, sourceFile, offenders, sanitised, mapping) {
+  const name = '_debug_export_block.log';
+  try {
+    const lines = [];
+    lines.push('=== Sanitiser export block diagnostic ===');
+    lines.push(`When:        ${new Date().toISOString()}`);
+    lines.push(`Case:        ${caseObj ? caseObj.id : '(unknown)'}`);
+    lines.push(`Source file: ${sourceFile || '(unknown)'}`);
+    lines.push(`Tool ver:    ${TOOL_VERSION}`);
+    lines.push(`Offenders:   ${offenders.length}`);
+    lines.push('');
+    offenders.forEach((o, i) => {
+      const entry = (mapping.entries || []).find((e) => e.token === o.token) || {};
+      lines.push(`--- Offender ${i + 1} ---`);
+      lines.push(`Matched text : "${o.original}"`);
+      lines.push(`Source       : ${o.source}   (mapping ${o.source === 'alias' ? 'alias' : 'original'})`);
+      lines.push(`Needle       : "${o.needle}"`);
+      lines.push(`Token        : ${o.token}`);
+      lines.push(`Category     : ${o.category || entry.category || '(none)'}`);
+      lines.push(`Sanitised pos: ${o.index}`);
+      lines.push(`Entry origin : "${entry.original || '(none)'}"`);
+      const aliasCount = (entry.aliases || []).length;
+      lines.push(`Entry aliases: ${aliasCount} (${aliasCount ? entry.aliases.slice(0, 10).map((a) => `"${a}"`).join(', ') + (aliasCount > 10 ? ', ...' : '') : ''})`);
+      lines.push(`Variations seeded: ${entry.variationsSeeded ? 'yes' : 'no'}`);
+      lines.push(`Context      : ${o.context}`);
+      // Is this hit inside a verbatim block?
+      const before = sanitised.slice(0, o.index);
+      const opens = (before.match(/<verbatim-referral\s/g) || []).length;
+      const closes = (before.match(/<\/verbatim-referral>/g) || []).length;
+      const inVerbatim = opens > closes;
+      lines.push(`Inside verbatim block: ${inVerbatim ? 'YES (verbatim blocks preserve raw text byte-for-byte)' : 'no'}`);
+      lines.push('');
+    });
+    lines.push('=== Mapping summary ===');
+    const entries = (mapping.entries || []);
+    lines.push(`Total mapping entries: ${entries.length}`);
+    entries.slice(0, 40).forEach((e) => {
+      lines.push(`  ${e.token}  <-  "${e.original}"  (category=${e.category || '?'}, aliases=${(e.aliases || []).length}${e.variationsSeeded ? ', seeded' : ''})`);
+    });
+    if (entries.length > 40) lines.push(`  (+${entries.length - 40} more not shown)`);
+    lines.push('');
+    lines.push('=== Sanitised body (leading 800 chars) ===');
+    lines.push(sanitised.slice(0, 800));
+    lines.push('');
+    lines.push('=== Sanitised body (trailing 800 chars) ===');
+    lines.push(sanitised.slice(Math.max(0, sanitised.length - 800)));
+    await writeFileText(caseObj.rawHandle, name, lines.join('\n'));
+  } catch (_e) { /* logging failure is non-fatal */ }
+  return name;
 }
 
 /**
