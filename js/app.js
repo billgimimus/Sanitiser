@@ -1315,16 +1315,31 @@ function setIndicator(label) {
 function checkOutgoing(sanitisedText, mapping) {
   const offenders = [];
   for (const entry of mapping.entries) {
-    const originals = [entry.original, ...(entry.aliases || [])];
-    for (const original of originals) {
-      const trimmed = (original || '').trim();
+    const originalTrimmed = (entry.original || '').trim();
+    if (originalTrimmed) {
+      // Keep the "possible-name" exception on the original itself: a
+      // single first name assumed as a person name is a soft flag; we
+      // don't want to block export on it here.
+      const skipOriginal = entry.category === 'name_possible' && !/\s/.test(originalTrimmed);
+      if (!skipOriginal) {
+        const rx = literalRegex(originalTrimmed);
+        const m = sanitisedText.match(rx);
+        if (m) offenders.push({ original: m[0], token: entry.token });
+      }
+    }
+    // Aliases exist to widen detection (auto-seeded "Gary", "Mr Martino",
+    // "G. Martino" et al.), NOT to widen outgoing verification. A
+    // multi-word alias like "Mr Martino" still counts - if it slips
+    // through detection we want to hear about it - but a single-word
+    // alias like "Gary" or "Martino" reliably matches ordinary words in
+    // verbatim blocks and produces a false trip. Skip those.
+    for (const alias of (entry.aliases || [])) {
+      const trimmed = (alias || '').trim();
       if (!trimmed) continue;
-      if (entry.category === 'name_possible' && !/\s/.test(trimmed)) continue;
+      if (!/\s/.test(trimmed)) continue;
       const rx = literalRegex(trimmed);
       const m = sanitisedText.match(rx);
-      if (m) {
-        offenders.push({ original: m[0], token: entry.token });
-      }
+      if (m) offenders.push({ original: m[0], token: entry.token });
     }
   }
   return offenders;
@@ -4015,20 +4030,16 @@ function installFloatingTokeniseButton() {
   document.addEventListener('keyup', (ev) => {
     if (ev.key === 'Escape') hideFloatingTokBtn();
   });
-  // A click on anything that isn't the floating button itself should
-  // clear it - covers clicks on other buttons that don't fire a fresh
-  // text mouseup.
+  // Any mousedown outside the floating button dismisses it. We used to
+  // only hide when the selection cleared, but that left it hanging over
+  // the file when the adviser started a new selection or clicked a UI
+  // control that doesn't disturb the selection. If they still want it,
+  // it re-appears on the next mouseup.
   document.addEventListener('mousedown', (ev) => {
-    if (floatingTokBtn && !floatingTokBtn.hidden && ev.target !== floatingTokBtn) {
-      // Give the mouseup/selectionchange path a tick to update the
-      // selection first; only hide if the selection was actually cleared.
-      setTimeout(() => {
-        const sel = window.getSelection();
-        const text = sel ? sel.toString().trim() : '';
-        if (!text || text.length < 2) hideFloatingTokBtn();
-      }, 0);
-    }
-  });
+    if (!floatingTokBtn || floatingTokBtn.hidden) return;
+    if (ev.target === floatingTokBtn) return;
+    hideFloatingTokBtn();
+  }, true);
   window.addEventListener('scroll', hideFloatingTokBtn, true);
 }
 
