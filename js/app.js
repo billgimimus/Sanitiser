@@ -1312,6 +1312,70 @@ function setIndicator(label) {
  * Public surface: checkOutgoing.
  */
 
+/**
+ * Safety net that runs after applySanitisation + rewriteVerbatimBlocks.
+ * Scans the finished sanitised body for any mapping original (or
+ * multi-word alias) that still appears literally and swaps it for the
+ * token. Regions inside <verbatim-referral> blocks are left alone (they
+ * are supposed to preserve the sanitised content byte-for-byte). This
+ * catches the "detection missed one occurrence" case that would
+ * otherwise trip checkOutgoing and block the export outright.
+ *
+ * Returns { text, sweptCount } so the caller can log what was caught.
+ */
+function postSanitiseSweep(sanitised, mapping) {
+  const entries = ((mapping && mapping.entries) || []).filter((e) => e && e.token && e.original);
+  if (!entries.length) return { text: sanitised, sweptCount: 0, swept: [] };
+  const needles = [];
+  for (const e of entries) {
+    const originalTrimmed = (e.original || '').trim();
+    if (originalTrimmed.length >= 2) {
+      needles.push({ needle: originalTrimmed, token: e.token, source: 'original' });
+    }
+    // Only multi-word aliases in the sweep - single-word aliases like
+    // the auto-seeded "Chris" match too many innocent words.
+    for (const a of (e.aliases || [])) {
+      const t = (a || '').trim();
+      if (t.length >= 2 && /\s/.test(t)) {
+        needles.push({ needle: t, token: e.token, source: 'alias' });
+      }
+    }
+  }
+  needles.sort((a, b) => b.needle.length - a.needle.length);
+  // Split the sanitised body into replaceable and preserved chunks by
+  // isolating <verbatim-referral> ... </verbatim-referral> regions.
+  const verbatimRx = /<verbatim-referral\s+id="[^"]*">[\s\S]*?<\/verbatim-referral>/g;
+  const chunks = [];
+  let cursor = 0;
+  let m;
+  while ((m = verbatimRx.exec(sanitised)) !== null) {
+    chunks.push({ text: sanitised.slice(cursor, m.index), replace: true });
+    chunks.push({ text: m[0], replace: false });
+    cursor = m.index + m[0].length;
+  }
+  chunks.push({ text: sanitised.slice(cursor), replace: true });
+  const swept = [];
+  const out = [];
+  for (const c of chunks) {
+    if (!c.replace) { out.push(c.text); continue; }
+    let piece = c.text;
+    for (const n of needles) {
+      const escaped = n.needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const looksAlphaNum = /^[A-Za-z0-9 '\-]+$/.test(n.needle);
+      const bounded = looksAlphaNum ? `\\b${escaped}\\b` : escaped;
+      const rx = new RegExp(bounded, 'gi');
+      let matched = false;
+      piece = piece.replace(rx, (hit) => {
+        matched = true;
+        return n.token;
+      });
+      if (matched) swept.push({ needle: n.needle, token: n.token, source: n.source });
+    }
+    out.push(piece);
+  }
+  return { text: out.join(''), sweptCount: swept.length, swept };
+}
+
 function checkOutgoing(sanitisedText, mapping) {
   const offenders = [];
   for (const entry of mapping.entries) {
@@ -4538,6 +4602,16 @@ async function onSanitise() {
   } catch (err) {
     showToast(`Verbatim rewrite failed: ${err.message}`, true);
     return;
+  }
+  // Safety net: sweep the finished sanitised body for any mapping
+  // originals that the decision list missed (e.g. a name detected in
+  // one place but not another because of an OCR quirk or a longer
+  // overlapping detector). Verbatim regions are exempt.
+  const sweepResult = postSanitiseSweep(sanitised, mapping);
+  sanitised = sweepResult.text;
+  if (sweepResult.sweptCount) {
+    const summary = sweepResult.swept.slice(0, 5).map((s) => `${s.needle} -> ${s.token}`).join('; ');
+    await appendAudit(c.rawHandle, `Post-sanitise sweep replaced ${sweepResult.sweptCount} missed occurrence(s): ${summary}${sweepResult.swept.length > 5 ? ', ...' : ''}.`);
   }
   const offenders = checkOutgoing(sanitised, mapping);
   if (offenders.length) {
