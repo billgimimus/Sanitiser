@@ -3046,6 +3046,24 @@ function renderSidebar() {
       actions.style.display = 'flex';
       actions.style.gap = '6px';
       actions.style.flexWrap = 'wrap';
+      const sanitisedInCase = (c.files || []).filter((f) => f.hasSanitised);
+      if (sanitisedInCase.length) {
+        const allTicked = sanitisedInCase.every((f) => state.selectedForBatch.has(`${c.id}::${f.name}`));
+        const btnSelectAll = document.createElement('button');
+        btnSelectAll.textContent = allTicked ? `Untick all (${sanitisedInCase.length})` : `Select all sanitised (${sanitisedInCase.length})`;
+        btnSelectAll.title = 'Tick every sanitised file in this case for the multi-file Copy sanitised bundle. Click again to untick them.';
+        btnSelectAll.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          for (const f of sanitisedInCase) {
+            const key = `${c.id}::${f.name}`;
+            if (allTicked) state.selectedForBatch.delete(key);
+            else state.selectedForBatch.add(key);
+          }
+          renderSidebar();
+          renderBatchBar();
+        });
+        actions.appendChild(btnSelectAll);
+      }
       if (c.kind === 'open') {
         const btnPaste = document.createElement('button');
         btnPaste.textContent = 'Paste text as new file';
