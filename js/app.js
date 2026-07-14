@@ -4606,19 +4606,13 @@ async function onSanitise() {
   // Safety net: sweep the finished sanitised body for any mapping
   // originals that the decision list missed (e.g. a name detected in
   // one place but not another because of an OCR quirk or a longer
-  // overlapping detector). Verbatim regions are exempt.
+  // overlapping detector). Verbatim regions are exempt. The sweep
+  // never blocks - re-sanitising is the fix, not the alarm.
   const sweepResult = postSanitiseSweep(sanitised, mapping);
   sanitised = sweepResult.text;
   if (sweepResult.sweptCount) {
     const summary = sweepResult.swept.slice(0, 5).map((s) => `${s.needle} -> ${s.token}`).join('; ');
     await appendAudit(c.rawHandle, `Post-sanitise sweep replaced ${sweepResult.sweptCount} missed occurrence(s): ${summary}${sweepResult.swept.length > 5 ? ', ...' : ''}.`);
-  }
-  const offenders = checkOutgoing(sanitised, mapping);
-  if (offenders.length) {
-    const logName = await writeExportBlockDebug(c, state.selectedFile, offenders, sanitised, mapping);
-    const detail = offenders.slice(0, 3).map((o) => `${o.source}:"${o.needle}"->${o.token}`).join(', ');
-    showToast(`Sanitisation blocked. ${offenders.length} identifier${offenders.length === 1 ? '' : 's'} still present (${detail}${offenders.length > 3 ? ', ...' : ''}). See ${logName} in the case folder for full details.`, true);
-    return;
   }
   const specialFlags = detectSpecialCategorySignals(state.currentText);
   if (specialFlags.length) {
@@ -4680,7 +4674,10 @@ async function onSanitise() {
   await appendAudit(c.rawHandle, `Sanitised (v${TOOL_VERSION}): ${state.selectedFile} (${result.decisions.length} reviewed decisions, ${result.mappingUpdates.length} new mapping entries)${autoNote}${urlNote}${safeAudit ? `; ${safeAudit}` : ''}${verbatimAudit}${watchlistAudit}${specialAudit}`);
   state.currentMapping = mapping;
   await selectFile(state.selectedFile);
-  showToast(verbatimIds.length ? `Sanitised file written with ${verbatimIds.length} verbatim block(s).` : 'Sanitised file written.');
+  const parts = ['Sanitised file written'];
+  if (verbatimIds.length) parts.push(`${verbatimIds.length} verbatim block(s)`);
+  if (sweepResult.sweptCount) parts.push(`safety sweep caught ${sweepResult.sweptCount} missed occurrence(s)`);
+  showToast(parts.join(' — ') + '.');
 }
 
 /**
@@ -4770,20 +4767,26 @@ async function onCopySanitisedBatch() {
   if (state.selectedForBatch.size === 0) return;
   const chunks = [];
   const missing = [];
+  let totalSwept = 0;
   for (const key of state.selectedForBatch) {
     const [caseId, name] = key.split('::');
     const c = state.cases.find((x) => x.id === caseId);
     if (!c) { missing.push(key); continue; }
     const fileObj = (c.files || []).find((f) => f.name === name) || {};
     const sanName = fileObj.sanitisedName || name;
+    let text;
     try {
-      let text;
       try { ({ text } = await readFileText(c.sanHandle, sanName)); }
       catch (_e) { ({ text } = await readFileText(c.sanHandle, name)); }
-      chunks.push(`\n\n===== ${caseId} / ${sanName} =====\n\n${text}`);
     } catch (_e) {
       missing.push(key);
+      continue;
     }
+    // Same escape-boundary guard as the single-file copy path.
+    const gate = await gateSanitisedTextForCopy(c, text, name);
+    if (!gate.ok) return; // Toast already shown by gate.
+    totalSwept += gate.sweptCount;
+    chunks.push(`\n\n===== ${caseId} / ${sanName} =====\n\n${gate.text}`);
   }
   if (!chunks.length) {
     showToast('Nothing to copy: none of the ticked files have a sanitised version yet.', true);
@@ -4792,7 +4795,8 @@ async function onCopySanitisedBatch() {
   const payload = `# Multi-file sanitised bundle: ${chunks.length} file(s)\n${chunks.join('')}`;
   try {
     await copyText(payload, `${chunks.length} sanitised files`);
-    showToast(`Copied ${chunks.length} sanitised file${chunks.length === 1 ? '' : 's'}${missing.length ? `, ${missing.length} skipped` : ''}.`);
+    const note = totalSwept ? ` Safety sweep caught ${totalSwept} occurrence(s) across the bundle; consider re-sanitising the affected files.` : '';
+    showToast(`Copied ${chunks.length} sanitised file${chunks.length === 1 ? '' : 's'}${missing.length ? `, ${missing.length} skipped` : ''}.${note}`);
   } catch (err) {
     showToast(err.message, true);
   }
@@ -4800,12 +4804,45 @@ async function onCopySanitisedBatch() {
 
 async function onCopySanitised() {
   if (!state.currentSanitised) return;
+  const c = state.cases.find((x) => x.id === state.selectedCaseId);
+  if (!c) return;
+  // The copy operation is where sanitised text is at risk of leaving
+  // the machine, so this is where we enforce the check. Re-sweep and
+  // re-check against the current mapping (which may have been edited
+  // since the sanitised file was written); silently fix what the sweep
+  // can, block only what it can't.
+  const gate = await gateSanitisedTextForCopy(c, state.currentSanitised, state.selectedFile);
+  if (!gate.ok) return;
   try {
-    await copyText(state.currentSanitised, `sanitised ${state.selectedFile}`);
-    showToast('Sanitised text copied. Paste into your AI service.');
+    await copyText(gate.text, `sanitised ${state.selectedFile}`);
+    const note = gate.sweptCount
+      ? ` Safety sweep caught ${gate.sweptCount} occurrence(s) since the file was last written; consider re-sanitising to persist the fix.`
+      : '';
+    showToast(`Sanitised text copied. Paste into your AI service.${note}`);
   } catch (err) {
     showToast(err.message, true);
   }
+}
+
+/**
+ * The single guarded copy path: takes the sanitised text about to leave
+ * the machine, re-runs the sweep against the current mapping, and if
+ * checkOutgoing still finds real identifiers dumps the debug log and
+ * blocks the copy. Returns { ok, text, sweptCount }. If !ok the caller
+ * should abort - a toast has already been shown.
+ */
+async function gateSanitisedTextForCopy(caseObj, sanitisedText, sourceLabel) {
+  const mapping = await loadMapping(caseObj.rawHandle, caseObj.id);
+  const sweep = postSanitiseSweep(sanitisedText, mapping);
+  const text = sweep.text;
+  const offenders = checkOutgoing(text, mapping);
+  if (offenders.length) {
+    const logName = await writeExportBlockDebug(caseObj, sourceLabel || '(copy)', offenders, text, mapping);
+    const detail = offenders.slice(0, 3).map((o) => `${o.source}:"${o.needle}"->${o.token}`).join(', ');
+    showToast(`Copy blocked. ${offenders.length} real identifier${offenders.length === 1 ? '' : 's'} would leave the machine (${detail}${offenders.length > 3 ? ', ...' : ''}). See ${logName} in the case folder.`, true);
+    return { ok: false, text, sweptCount: sweep.sweptCount };
+  }
+  return { ok: true, text, sweptCount: sweep.sweptCount };
 }
 
 async function onPasteRehydrate() {
