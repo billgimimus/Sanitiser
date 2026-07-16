@@ -661,7 +661,7 @@ async function listFiles(rawHandle, sanHandle, mapping) {
   const filemap = (mapping && mapping.sanitisedFilenames) || {};
   for await (const entry of rawHandle.values()) {
     if (entry.kind !== 'file') continue;
-    if (entry.name === '_mapping.json' || entry.name === '_closure.json' || entry.name === '_audit.log' || entry.name === '_debug_export_block.log') continue;
+    if (entry.name === '_mapping.json' || entry.name === '_closure.json' || entry.name === '_audit.log' || entry.name === '_debug_export_block.log' || entry.name === '_debug_rehydrate.log') continue;
     const file = await entry.getFile();
     // If the mapping remembers a safe-form sanitised name for this raw
     // file, use it; otherwise fall back to same-name pairing so files
@@ -2850,6 +2850,8 @@ function init() {
   primeReopenButton();
   document.getElementById('btn-new-case').addEventListener('click', onNewCase);
   document.getElementById('btn-paste-rehydrate').addEventListener('click', onPasteRehydrate);
+  const hydrateBtn = document.getElementById('btn-hydrate');
+  if (hydrateBtn) hydrateBtn.addEventListener('click', onHydratePaste);
   const refreshBtn = document.getElementById('btn-refresh-cases');
   if (refreshBtn) refreshBtn.addEventListener('click', onRefreshCases);
   const searchBtn = document.getElementById('btn-search');
@@ -4864,16 +4866,41 @@ async function gateSanitisedTextForCopy(caseObj, sanitisedText, sourceLabel) {
 }
 
 async function onPasteRehydrate() {
+  await openHydrationDialog({
+    title: 'Rehydrate AI reply',
+    actionLabel: 'Rehydrate',
+    helpLine: 'Paste an AI reply that used the case tokens, or drop the file. The tool replaces every token with its real value from the mapping and saves the result to Casework_rehydrated as an audit trail.',
+    origin: 'rehydrate',
+  });
+}
+
+async function onHydratePaste() {
+  await openHydrationDialog({
+    title: 'Hydrate pasted text',
+    actionLabel: 'Hydrate',
+    helpLine: 'Paste text from Claude (or another source) that references case tokens. The tool substitutes real values from the case mapping for every token it recognises. Give the output a filename and a source label so it lands in the audit trail alongside the sanitised material it relates to.',
+    origin: 'hydrate',
+  });
+}
+
+async function openHydrationDialog(opts) {
   if (!state.selectedCaseId) {
     showToast('Select a case first so the tool knows which mapping to use.', true);
     return;
   }
   const c = state.cases.find((x) => x.id === state.selectedCaseId);
   if (!c) return;
-  const text = await openRehydrateInputDialog();
-  if (text == null) return;
-  if (!text.trim()) { showToast('Nothing to rehydrate - the input was empty.', true); return; }
-  await rehydrateTextForCase(c, text, { origin: 'paste' });
+  const dialogResult = await openRehydrateInputDialog({
+    title: opts.title,
+    actionLabel: opts.actionLabel,
+    helpLine: opts.helpLine,
+    caseObj: c,
+    defaultSource: opts.origin === 'hydrate' ? 'Claude paste (hydrate)' : 'Claude reply (rehydrate)',
+  });
+  if (dialogResult == null) return;
+  const { text, filename, source, relatedFile } = dialogResult;
+  if (!text || !text.trim()) { showToast('Nothing to hydrate - the input was empty.', true); return; }
+  await rehydrateTextForCase(c, text, { origin: opts.origin || 'paste', filename, source, relatedFile });
 }
 
 /**
@@ -4915,58 +4942,183 @@ async function onRehydrateSanFile(caseObj, name) {
  */
 async function rehydrateTextForCase(c, text, opts) {
   const origin = (opts && opts.origin) || 'paste';
-  const mapping = await loadMapping(c.rawHandle, c.id);
-  const { hits, replaced, cleaned, verbatimMismatches } = rehydrate(text, mapping);
+  const explicitFilename = opts && opts.filename;
+  const explicitSource = opts && opts.source;
+  const relatedFile = opts && opts.relatedFile;
+  let mapping;
+  try {
+    mapping = await loadMapping(c.rawHandle, c.id);
+  } catch (err) {
+    await writeRehydrateDebug(c, { origin, text, opts, phase: 'loadMapping', error: err });
+    showToast(`Could not load the case mapping: ${err.message}. See _debug_rehydrate.log in the case folder.`, true);
+    return;
+  }
+  let rehydrateResult;
+  try {
+    rehydrateResult = rehydrate(text, mapping);
+  } catch (err) {
+    await writeRehydrateDebug(c, { origin, text, opts, phase: 'rehydrate', error: err, mapping });
+    showToast(`Rehydration failed: ${err.message}. See _debug_rehydrate.log in the case folder.`, true);
+    return;
+  }
+  const { hits, replaced, cleaned, verbatimMismatches } = rehydrateResult;
   if (verbatimMismatches && verbatimMismatches.length) {
     const choice = await showVerbatimMismatchDialog(verbatimMismatches);
     if (choice === 'abort') {
-      showToast('Rehydration aborted. Verbatim block mismatch left unresolved.', true);
+      await writeRehydrateDebug(c, { origin, text, opts, phase: 'verbatim-aborted', verbatimMismatches, mapping });
+      showToast('Rehydration aborted. Verbatim block mismatch left unresolved. See _debug_rehydrate.log for the diff.', true);
       return;
     }
     await appendAudit(c.rawHandle, `Verbatim mismatch acknowledged and overridden by adviser for ${verbatimMismatches.length} block(s).`);
   }
   if (hits.length) {
+    await writeRehydrateDebug(c, { origin, text, opts, phase: 'integrity-hits', hits, replaced, mapping });
     await showRehydrateIntegrityDialog(hits, replaced, cleaned, mapping);
     return;
   }
   try {
     await copyText(replaced, 'rehydrated text');
   } catch (err) {
-    showToast(err.message, true);
-    return;
+    await writeRehydrateDebug(c, { origin, text, opts, phase: 'clipboard-copy', error: err, replaced });
+    showToast(`${err.message}. See _debug_rehydrate.log for details; the rehydrated text was NOT copied but was saved to disk.`, true);
+    // Fall through and still try to persist to disk so the adviser has
+    // something to work with even if the clipboard is unavailable.
   }
-  // Persist the trail. Paste-driven rehydrates need both artefacts on
-  // disk; file-driven rehydrates already have the tokenised input in
-  // the sanitised folder and only need the rehydrated output written.
-  let sanitisedName = opts && opts.sourceName ? opts.sourceName : null;
+  // Persist the trail. Filename precedence:
+  //   1. explicit filename from the dialog
+  //   2. sourceName from a file-click rehydrate (input file's name)
+  //   3. auto-generated paste_YYYYMMDD_HHMMSS.txt
+  let sanitisedName = null;
+  if (opts && opts.sourceName) sanitisedName = opts.sourceName;
+  else if (relatedFile) sanitisedName = relatedFile;
   let rehydratedName = null;
   try {
-    if (origin === 'paste') {
-      const stamp = timestampSlug();
-      const baseName = `paste_${stamp}.txt`;
-      await writeFileText(c.sanHandle, baseName, text);
-      sanitisedName = baseName;
-      // Refresh cached list so the sidebar picks up the new sanitised entry.
-      if (c.aiReplies) c.aiReplies.unshift({ name: baseName, size: text.length, lastModified: Date.now() });
+    if (origin === 'paste' || origin === 'rehydrate' || origin === 'hydrate') {
+      // Paste-driven: also save the tokenised input into the sanitised
+      // folder so the audit trail has both sides. Skip if we're already
+      // pointing at an existing sanitised file (avoids overwriting it).
+      let inputName;
+      if (explicitFilename) {
+        // Filename in the dialog is the OUTPUT name; derive an input name.
+        const dot = explicitFilename.lastIndexOf('.');
+        const base = dot > 0 ? explicitFilename.slice(0, dot) : explicitFilename;
+        inputName = base.endsWith('.rehydrated')
+          ? base.slice(0, -'.rehydrated'.length) + '.txt'
+          : `${base}.input.txt`;
+      } else {
+        inputName = `paste_${timestampSlug()}.txt`;
+      }
+      if (!relatedFile) {
+        try {
+          await writeFileText(c.sanHandle, inputName, text);
+          if (c.aiReplies) c.aiReplies.unshift({ name: inputName, size: text.length, lastModified: Date.now() });
+          if (!sanitisedName) sanitisedName = inputName;
+        } catch (_e) { /* best effort */ }
+      }
     }
-    if (c.rehyHandle && sanitisedName) {
-      rehydratedName = pairedRehydratedName(sanitisedName);
+    if (c.rehyHandle) {
+      rehydratedName = explicitFilename
+        || (sanitisedName ? pairedRehydratedName(sanitisedName) : `paste_${timestampSlug()}.rehydrated.txt`);
       await writeFileText(c.rehyHandle, rehydratedName, replaced);
       if (!c.rehydrated) c.rehydrated = [];
       c.rehydrated.unshift({ name: rehydratedName, size: replaced.length, lastModified: Date.now() });
     }
   } catch (err) {
-    showToast(`Rehydrated text copied but could not be saved to disk: ${err.message}`, true);
+    await writeRehydrateDebug(c, { origin, text, opts, phase: 'disk-save', error: err, replaced });
+    showToast(`Rehydrated text copied but could not be saved to disk: ${err.message}. See _debug_rehydrate.log.`, true);
   }
   const mismatchNote = verbatimMismatches && verbatimMismatches.length ? `; ${verbatimMismatches.length} verbatim mismatch(es) overridden` : '';
   const tokenCount = (text.match(/\[[A-Z_]+.*?\]/g) || []).length;
-  const originLabel = origin === 'file' ? `file ${opts.sourceName}` : 'clipboard paste';
+  const sourceLabel = explicitSource
+    || (opts && opts.sourceName ? `file ${opts.sourceName}` : 'clipboard paste');
   const savedNote = rehydratedName ? `; saved as ${rehydratedName}` : '';
-  await appendAudit(c.rawHandle, `Rehydrated ${text.length} chars from ${originLabel} (${tokenCount} tokens)${mismatchNote}${savedNote}.`);
+  await appendAudit(c.rawHandle, `Rehydrated ${text.length} chars from ${sourceLabel} (${tokenCount} tokens)${mismatchNote}${savedNote}.`);
   showToast(rehydratedName
     ? `Rehydrated text copied and saved to Casework_rehydrated as ${rehydratedName}.`
     : 'Rehydrated text copied. Paste into Outlook or CRM.');
   renderSidebar();
+}
+
+/**
+ * Persist a diagnostic file whenever paste-rehydrate hits a snag. Same
+ * pattern as writeExportBlockDebug - written to the case's raw folder,
+ * overwritten each time so the file always reflects the most recent
+ * attempt. Captures the input, the phase that failed, the error, and a
+ * mapping summary so the adviser can share the log for debugging.
+ */
+async function writeRehydrateDebug(caseObj, info) {
+  const name = '_debug_rehydrate.log';
+  try {
+    const lines = [];
+    lines.push('=== Sanitiser rehydrate diagnostic ===');
+    lines.push(`When:      ${new Date().toISOString()}`);
+    lines.push(`Case:      ${caseObj ? caseObj.id : '(unknown)'}`);
+    lines.push(`Tool ver:  ${TOOL_VERSION}`);
+    lines.push(`Origin:    ${info.origin}`);
+    lines.push(`Phase:     ${info.phase}`);
+    if (info.opts) {
+      lines.push(`Opts:      filename="${info.opts.filename || ''}" source="${info.opts.source || ''}" relatedFile="${info.opts.relatedFile || ''}" sourceName="${info.opts.sourceName || ''}"`);
+    }
+    if (info.error) {
+      lines.push(`Error:     ${info.error.name || 'Error'}: ${info.error.message}`);
+      if (info.error.stack) lines.push('Stack:');
+      if (info.error.stack) info.error.stack.split('\n').slice(0, 15).forEach((l) => lines.push('  ' + l));
+    }
+    lines.push('');
+    if (info.text != null) {
+      lines.push(`Input length: ${info.text.length} chars`);
+      const tokens = info.text.match(/\[[A-Z_'\s]+(?:_\d+)?\]/g) || [];
+      lines.push(`Tokens seen : ${tokens.length}`);
+      if (tokens.length) {
+        const counts = {};
+        for (const t of tokens) counts[t] = (counts[t] || 0) + 1;
+        lines.push('Token histogram:');
+        Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 30).forEach(([t, n]) => lines.push(`  ${t}  x${n}`));
+      }
+      lines.push('');
+      lines.push('=== Input (leading 800 chars) ===');
+      lines.push(info.text.slice(0, 800));
+      lines.push('');
+      lines.push('=== Input (trailing 800 chars) ===');
+      lines.push(info.text.slice(Math.max(0, info.text.length - 800)));
+      lines.push('');
+    }
+    if (info.hits && info.hits.length) {
+      lines.push(`Integrity hits: ${info.hits.length}`);
+      info.hits.slice(0, 20).forEach((h, i) => {
+        lines.push(`  ${i + 1}. ${JSON.stringify(h)}`);
+      });
+      lines.push('');
+    }
+    if (info.verbatimMismatches && info.verbatimMismatches.length) {
+      lines.push(`Verbatim mismatches: ${info.verbatimMismatches.length}`);
+      info.verbatimMismatches.slice(0, 10).forEach((mm, i) => {
+        lines.push(`  ${i + 1}. id=${mm.id} reason=${mm.reason}`);
+        lines.push(`     expected: ${(mm.expected || '').slice(0, 200)}`);
+        lines.push(`     actual  : ${(mm.actual || '').slice(0, 200)}`);
+      });
+      lines.push('');
+    }
+    if (info.replaced != null) {
+      lines.push(`Output length: ${info.replaced.length} chars`);
+      lines.push('');
+      lines.push('=== Output (leading 800 chars) ===');
+      lines.push(info.replaced.slice(0, 800));
+      lines.push('');
+    }
+    if (info.mapping) {
+      const entries = info.mapping.entries || [];
+      lines.push(`Mapping entries: ${entries.length}`);
+      entries.slice(0, 40).forEach((e) => {
+        lines.push(`  ${e.token}  <-  "${e.original}"  (category=${e.category || '?'}, aliases=${(e.aliases || []).length}${e.variationsSeeded ? ', seeded' : ''})`);
+      });
+      if (entries.length > 40) lines.push(`  (+${entries.length - 40} more not shown)`);
+    }
+    if (caseObj && caseObj.rawHandle) {
+      await writeFileText(caseObj.rawHandle, name, lines.join('\n'));
+    }
+  } catch (_e) { /* logging failure is non-fatal */ }
+  return name;
 }
 
 /**
@@ -4987,6 +5139,18 @@ async function writeExportBlockDebug(caseObj, sourceFile, offenders, sanitised, 
     lines.push(`Source file: ${sourceFile || '(unknown)'}`);
     lines.push(`Tool ver:    ${TOOL_VERSION}`);
     lines.push(`Offenders:   ${offenders.length}`);
+    lines.push(`Sanitised body length: ${sanitised.length} chars`);
+    const tokenMatches = sanitised.match(/\[[A-Z_'\s]+(?:_\d+)?\]/g) || [];
+    lines.push(`Tokens in output:      ${tokenMatches.length}`);
+    if (tokenMatches.length) {
+      const tokenCounts = {};
+      for (const t of tokenMatches) tokenCounts[t] = (tokenCounts[t] || 0) + 1;
+      const topTokens = Object.entries(tokenCounts).sort((a, b) => b[1] - a[1]).slice(0, 20)
+        .map(([t, n]) => `${t}=${n}`).join(', ');
+      lines.push(`Token histogram (top 20): ${topTokens}`);
+    }
+    const verbatimIds = Array.from(sanitised.matchAll(/<verbatim-referral\s+id="([^"]+)"/g)).map((m) => m[1]);
+    lines.push(`Verbatim blocks in output: ${verbatimIds.length}${verbatimIds.length ? ' (' + verbatimIds.join(', ') + ')' : ''}`);
     lines.push('');
     offenders.forEach((o, i) => {
       const entry = (mapping.entries || []).find((e) => e.token === o.token) || {};
@@ -4999,10 +5163,13 @@ async function writeExportBlockDebug(caseObj, sourceFile, offenders, sanitised, 
       lines.push(`Sanitised pos: ${o.index}`);
       lines.push(`Entry origin : "${entry.original || '(none)'}"`);
       const aliasCount = (entry.aliases || []).length;
-      lines.push(`Entry aliases: ${aliasCount} (${aliasCount ? entry.aliases.slice(0, 10).map((a) => `"${a}"`).join(', ') + (aliasCount > 10 ? ', ...' : '') : ''})`);
+      lines.push(`Entry aliases: ${aliasCount} (${aliasCount ? entry.aliases.slice(0, 12).map((a) => `"${a}"`).join(', ') + (aliasCount > 12 ? ', ...' : '') : ''})`);
       lines.push(`Variations seeded: ${entry.variationsSeeded ? 'yes' : 'no'}`);
-      lines.push(`Context      : ${o.context}`);
-      // Is this hit inside a verbatim block?
+      lines.push(`Context (60 chars each side): ${o.context}`);
+      const from = Math.max(0, o.index - 120);
+      const to = Math.min(sanitised.length, o.index + o.original.length + 120);
+      lines.push(`Wider context (120 chars each side):`);
+      lines.push(`  ${sanitised.slice(from, o.index)}<<<${sanitised.slice(o.index, o.index + o.original.length)}>>>${sanitised.slice(o.index + o.original.length, to)}`);
       const before = sanitised.slice(0, o.index);
       const opens = (before.match(/<verbatim-referral\s/g) || []).length;
       const closes = (before.match(/<\/verbatim-referral>/g) || []).length;
@@ -5013,16 +5180,16 @@ async function writeExportBlockDebug(caseObj, sourceFile, offenders, sanitised, 
     lines.push('=== Mapping summary ===');
     const entries = (mapping.entries || []);
     lines.push(`Total mapping entries: ${entries.length}`);
-    entries.slice(0, 40).forEach((e) => {
+    entries.slice(0, 60).forEach((e) => {
       lines.push(`  ${e.token}  <-  "${e.original}"  (category=${e.category || '?'}, aliases=${(e.aliases || []).length}${e.variationsSeeded ? ', seeded' : ''})`);
     });
-    if (entries.length > 40) lines.push(`  (+${entries.length - 40} more not shown)`);
+    if (entries.length > 60) lines.push(`  (+${entries.length - 60} more not shown)`);
     lines.push('');
-    lines.push('=== Sanitised body (leading 800 chars) ===');
-    lines.push(sanitised.slice(0, 800));
+    lines.push('=== Sanitised body (leading 1500 chars) ===');
+    lines.push(sanitised.slice(0, 1500));
     lines.push('');
-    lines.push('=== Sanitised body (trailing 800 chars) ===');
-    lines.push(sanitised.slice(Math.max(0, sanitised.length - 800)));
+    lines.push('=== Sanitised body (trailing 1500 chars) ===');
+    lines.push(sanitised.slice(Math.max(0, sanitised.length - 1500)));
     await writeFileText(caseObj.rawHandle, name, lines.join('\n'));
   } catch (_e) { /* logging failure is non-fatal */ }
   return name;
@@ -5058,7 +5225,32 @@ function pairedRehydratedName(sanitisedName) {
  * that the old direct-read path hit whenever the tool tab was not the
  * active window. Resolves to the text or null on cancel.
  */
-function openRehydrateInputDialog() {
+/**
+ * Rich input dialog for paste-hydration. Returns:
+ *   { text, filename, source, relatedFile }  on OK
+ *   null                                     on cancel
+ *
+ * `opts.title` and `opts.actionLabel` let the same dialog serve
+ * "Rehydrate a returning AI reply" and "Hydrate fresh Claude output"
+ * without duplicating the UI. `opts.caseObj` is used to populate the
+ * "Related to" dropdown with the case's existing sanitised files, so
+ * the resulting rehydrated file lands in a predictable place beside
+ * its source.
+ */
+function openRehydrateInputDialog(opts) {
+  const title = (opts && opts.title) || 'Paste to hydrate';
+  const actionLabel = (opts && opts.actionLabel) || 'Hydrate';
+  const caseObj = opts && opts.caseObj;
+  const helpLine = (opts && opts.helpLine)
+    || 'Ctrl+V into the box, or drop a <code>.txt</code> or <code>.docx</code> file. Rehydration runs against the selected case\'s mapping.';
+  const defaultFilename = (opts && opts.defaultFilename) || `paste_${timestampSlug()}.txt`;
+  const defaultSource = (opts && opts.defaultSource) || 'Claude paste';
+  const sanFiles = caseObj && caseObj.files
+    ? caseObj.files.filter((f) => f.hasSanitised).map((f) => f.sanitisedName || f.name)
+    : [];
+  const relatedOptions = ['<option value="">(no related file)</option>']
+    .concat(sanFiles.map((n) => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`))
+    .join('');
   return new Promise((resolve) => {
     const root = document.getElementById('dialog-root');
     root.innerHTML = '';
@@ -5066,22 +5258,38 @@ function openRehydrateInputDialog() {
     backdrop.className = 'modal-backdrop';
     const modal = document.createElement('div');
     modal.className = 'modal';
-    modal.style.width = '760px';
+    modal.style.width = '780px';
     backdrop.appendChild(modal);
     modal.innerHTML = `
-      <div class="modal-header">Paste the AI reply to rehydrate</div>
+      <div class="modal-header">${escapeHtml(title)}</div>
       <div class="modal-body">
-        <p class="muted" style="margin-top:0;">Ctrl+V into the box, or drop a <code>.txt</code> or <code>.docx</code> file. Rehydration runs against the selected case's mapping.</p>
-        <textarea id="rehy-textarea" spellcheck="false" style="width:100%;min-height:260px;font-family:var(--mono);font-size:12px;padding:8px;border:1px solid var(--border);border-radius:4px;box-sizing:border-box;" placeholder="Paste the AI reply here..."></textarea>
-        <div id="rehy-dropzone" style="margin-top:8px;padding:14px;border:2px dashed var(--border);border-radius:6px;text-align:center;color:var(--muted);font-size:12px;">
+        <p class="muted" style="margin-top:0;">${helpLine}</p>
+        <textarea id="rehy-textarea" spellcheck="false" style="width:100%;min-height:220px;font-family:var(--mono);font-size:12px;padding:8px;border:1px solid var(--border);border-radius:4px;box-sizing:border-box;" placeholder="Paste the text here..."></textarea>
+        <div id="rehy-dropzone" style="margin-top:8px;padding:12px;border:2px dashed var(--border);border-radius:6px;text-align:center;color:var(--muted);font-size:12px;">
           Or drop a <strong>.txt</strong> or <strong>.docx</strong> file here.
           <div style="margin-top:6px;"><input id="rehy-file" type="file" accept=".txt,.docx,text/plain,application/vnd.openxmlformats-officedocument.wordprocessingml.document" style="font-size:12px;"></div>
         </div>
-        <div id="rehy-status" class="muted" style="margin-top:6px;font-size:12px;"></div>
+        <div style="margin-top:12px;display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+          <div>
+            <label style="font-size:12px;color:var(--muted);">Save output as (filename)</label>
+            <input id="rehy-filename" type="text" value="${escapeHtml(defaultFilename)}" style="width:100%;font-family:var(--mono);font-size:12px;padding:6px;border:1px solid var(--border);border-radius:4px;box-sizing:border-box;">
+          </div>
+          <div>
+            <label style="font-size:12px;color:var(--muted);">Source label (for audit trail)</label>
+            <input id="rehy-source" type="text" value="${escapeHtml(defaultSource)}" style="width:100%;font-size:12px;padding:6px;border:1px solid var(--border);border-radius:4px;box-sizing:border-box;">
+          </div>
+        </div>
+        <div style="margin-top:10px;">
+          <label style="font-size:12px;color:var(--muted);">Related to existing sanitised file (optional - pairs the output with a source)</label>
+          <select id="rehy-related" style="width:100%;font-size:12px;padding:6px;border:1px solid var(--border);border-radius:4px;box-sizing:border-box;">
+            ${relatedOptions}
+          </select>
+        </div>
+        <div id="rehy-status" class="muted" style="margin-top:8px;font-size:12px;"></div>
       </div>
       <div class="modal-footer">
         <button data-action="cancel">Cancel</button>
-        <button class="primary" data-action="ok">Rehydrate</button>
+        <button class="primary" data-action="ok">${escapeHtml(actionLabel)}</button>
       </div>
     `;
     root.appendChild(backdrop);
@@ -5089,8 +5297,21 @@ function openRehydrateInputDialog() {
     const status = modal.querySelector('#rehy-status');
     const dropzone = modal.querySelector('#rehy-dropzone');
     const fileInput = modal.querySelector('#rehy-file');
-    // Best-effort autofill from clipboard: silent on failure so the
-    // adviser can still paste manually.
+    const filenameInput = modal.querySelector('#rehy-filename');
+    const sourceInput = modal.querySelector('#rehy-source');
+    const relatedSelect = modal.querySelector('#rehy-related');
+    // If the adviser picks a related file, offer a sensible default
+    // filename derived from it so the rehydrated output lands
+    // paired-by-basename in the rehydrated folder.
+    relatedSelect.addEventListener('change', () => {
+      const v = relatedSelect.value;
+      if (v && filenameInput.value.startsWith('paste_')) {
+        const dot = v.lastIndexOf('.');
+        const base = dot > 0 ? v.slice(0, dot) : v;
+        filenameInput.value = `${base}.rehydrated.txt`;
+      }
+    });
+    // Best-effort autofill from clipboard: silent on failure.
     (async () => {
       try {
         if (navigator.clipboard && navigator.clipboard.readText) {
@@ -5118,6 +5339,10 @@ function openRehydrateInputDialog() {
           ta.value = text;
           status.textContent = `Loaded ${file.name} (${text.length} characters).`;
         }
+        // If the loaded file's name matches a sanitised file in this case,
+        // pre-select the related-to dropdown for convenience.
+        const opt = Array.from(relatedSelect.options).find((o) => o.value === file.name);
+        if (opt) { relatedSelect.value = file.name; relatedSelect.dispatchEvent(new Event('change')); }
       } catch (err) {
         status.textContent = `Could not read ${file.name}: ${err.message}`;
       }
@@ -5132,7 +5357,16 @@ function openRehydrateInputDialog() {
       if (f) loadFile(f);
     });
     modal.querySelector('[data-action="cancel"]').addEventListener('click', () => { backdrop.remove(); resolve(null); });
-    modal.querySelector('[data-action="ok"]').addEventListener('click', () => { const v = ta.value; backdrop.remove(); resolve(v); });
+    modal.querySelector('[data-action="ok"]').addEventListener('click', () => {
+      const result = {
+        text: ta.value,
+        filename: filenameInput.value.trim() || defaultFilename,
+        source: sourceInput.value.trim() || defaultSource,
+        relatedFile: relatedSelect.value || null,
+      };
+      backdrop.remove();
+      resolve(result);
+    });
   });
 }
 
